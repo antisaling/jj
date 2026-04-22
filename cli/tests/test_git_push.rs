@@ -19,6 +19,7 @@ use testutils::git;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+use crate::common::set_up_fake_git_lfs;
 use crate::common::to_toml_value;
 
 fn git_repo_dir_for_jj_repo(work_dir: &TestWorkDir<'_>) -> std::path::PathBuf {
@@ -2856,6 +2857,221 @@ fn test_git_push_rejected_by_remote() -> TestResult {
         ");
     });
     Ok(())
+}
+
+#[test]
+fn test_git_push_aborts_when_lfs_upload_fails() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "push");
+    test_env.add_env_var("FAKE_GIT_LFS_LS_FILES_STATE", "present");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "origin"])
+        .success();
+    let origin_dir = test_env.work_dir("origin");
+    origin_dir
+        .run_jj(["describe", "-m=description 1"])
+        .success();
+    origin_dir
+        .run_jj(["bookmark", "create", "-r@", "bookmark1"])
+        .success();
+    test_env
+        .run_jj_in(
+            ".",
+            [
+                "git",
+                "clone",
+                "--colocate",
+                "--config=remotes.origin.auto-track-bookmarks='*'",
+                "origin",
+                "local",
+            ],
+        )
+        .success();
+    let work_dir = test_env.work_dir("local");
+    work_dir.write_file(".git/lfs/objects/aa/bb/placeholder", "placeholder");
+    work_dir
+        .run_jj(["new", "bookmark1", "-m", "description 2"])
+        .success();
+    work_dir.write_file("file", "file");
+    work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
+
+    let output = work_dir.run_jj(["git", "push", "--bookmark", "bookmark1"]);
+    assert!(
+        !output.status.success(),
+        "expected push to fail, got:\n{output}"
+    );
+    assert!(
+        output.stderr.raw().contains("Changes to push to origin:"),
+        "expected push summary in stderr, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("fake git-lfs: forced failure for subcommand `push`"),
+        "expected fake git-lfs failure in stderr, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("`git-lfs push` failed with exit")
+            && output
+                .stderr
+                .raw()
+                .contains("; aborting push to avoid dangling LFS pointers"),
+        "expected `git-lfs push` failure message, got:\n{output}"
+    );
+
+    insta::assert_snapshot!(get_bookmark_output(&work_dir), @"
+    bookmark1: mzvwutvl d6221a0c description 2
+      @git: mzvwutvl d6221a0c description 2
+      @origin (behind by 1 commits): qpvuntsm 9b2e76de (empty) description 1
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_git_push_non_colocated_aborts_when_lfs_upload_fails() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    set_up(&test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "push");
+    test_env.add_env_var("FAKE_GIT_LFS_LS_FILES_STATE", "present");
+    let work_dir = test_env.work_dir("local");
+    let local_git_repo_path = git_repo_dir_for_jj_repo(&work_dir);
+    std::fs::create_dir_all(local_git_repo_path.join("lfs/objects/aa/bb")).unwrap();
+    work_dir.write_file(
+        ".jj/repo/store/git/lfs/objects/aa/bb/placeholder",
+        "placeholder",
+    );
+
+    work_dir
+        .run_jj(["new", "bookmark1", "-m", "description 2"])
+        .success();
+    work_dir.write_file("file", "file");
+    work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
+
+    let output = work_dir.run_jj(["git", "push", "--bookmark", "bookmark1"]);
+    assert!(
+        !output.status.success(),
+        "expected push to fail, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("`git-lfs push` failed with exit")
+            && output
+                .stderr
+                .raw()
+                .contains("; aborting push to avoid dangling LFS pointers"),
+        "expected `git-lfs push` failure message, got:\n{output}"
+    );
+    let bookmark_output = get_bookmark_output(&work_dir).stdout.into_raw();
+    assert!(
+        bookmark_output.contains("@origin (behind by 1 commits)"),
+        "origin bookmark should not have advanced:\n{bookmark_output}"
+    );
+
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.lines().any(|line| line.starts_with("push\t")),
+        "git-lfs push should have been invoked, but got:\n{log}"
+    );
+}
+
+#[test]
+fn test_git_push_non_colocated_aborts_when_lfs_upload_fails_with_empty_lfs_cache() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    set_up(&test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "push");
+    test_env.add_env_var("FAKE_GIT_LFS_LS_FILES_STATE", "missing");
+    let work_dir = test_env.work_dir("local");
+    let local_git_repo_path = git_repo_dir_for_jj_repo(&work_dir);
+    let lfs_objects_dir = local_git_repo_path.join("lfs/objects");
+    assert!(
+        !lfs_objects_dir.exists(),
+        "test precondition failed: expected empty/non-existent LFS objects dir at {}",
+        lfs_objects_dir.display()
+    );
+
+    work_dir
+        .run_jj(["new", "bookmark1", "-m", "description 2"])
+        .success();
+    work_dir.write_file("file", "file");
+    work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
+
+    let output = work_dir.run_jj(["git", "push", "--bookmark", "bookmark1"]);
+    assert!(
+        !output.status.success(),
+        "expected push to fail when fake git-lfs push fails, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("`git-lfs push` failed with exit")
+            && output
+                .stderr
+                .raw()
+                .contains("; aborting push to avoid dangling LFS pointers"),
+        "expected `git-lfs push` failure message, got:\n{output}"
+    );
+    let bookmark_output = get_bookmark_output(&work_dir).stdout.into_raw();
+    assert!(
+        bookmark_output.contains("@origin (behind by 1 commits)"),
+        "origin bookmark should not have advanced:\n{bookmark_output}"
+    );
+
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.lines().any(|line| line.starts_with("push\t")),
+        "git-lfs push should have been invoked even with empty cache, but got:\n{log}"
+    );
+}
+
+#[test]
+fn test_git_push_non_colocated_skips_lfs_upload_when_refs_have_no_lfs_files() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    set_up(&test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "push");
+    let work_dir = test_env.work_dir("local");
+
+    work_dir
+        .run_jj(["new", "bookmark1", "-m", "description 2"])
+        .success();
+    work_dir.write_file("file", "file");
+    work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
+
+    work_dir
+        .run_jj(["git", "push", "--bookmark", "bookmark1"])
+        .success();
+    let bookmark_output = get_bookmark_output(&work_dir).stdout.into_raw();
+    assert!(
+        !bookmark_output.contains("@origin (behind by 1 commits)"),
+        "origin bookmark should have advanced:\n{bookmark_output}"
+    );
+
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.lines().any(|line| line.starts_with("ls-files\t")),
+        "git-lfs ls-files should have been invoked, but got:\n{log}"
+    );
+    assert!(
+        !log.lines().any(|line| line.starts_with("push\t")),
+        "git-lfs push should have been skipped when no LFS files were detected, but got:\n{log}"
+    );
 }
 
 #[test]
