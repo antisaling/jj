@@ -17,6 +17,7 @@ use regex::Regex;
 use testutils::TestResult;
 
 use crate::common::TestEnvironment;
+use crate::common::set_up_fake_git_lfs;
 
 #[test]
 fn test_snapshot_large_file() {
@@ -163,6 +164,119 @@ fn test_snapshot_large_file_restore() {
     Parent commit (@-): zzzzzzzz 00000000 (empty) (no description set)
     [EOF]
     ");
+}
+
+#[test]
+fn test_snapshot_non_lfs_ignore_filter_does_not_run_git_lfs_clean() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["git-crypt"]"#);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "*.secret filter=git-crypt\n");
+    work_dir.write_file("hidden.secret", "top secret\n");
+
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A .gitattributes
+    Working copy  (@) : qpvuntsm 2cee86fa (no description set)
+    Parent commit (@-): zzzzzzzz 00000000 (empty) (no description set)
+    [EOF]
+    ");
+
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.trim().is_empty(),
+        "git-lfs should not have been invoked, but got:\n{log}"
+    );
+}
+
+#[test]
+fn test_snapshot_lfs_clean_failure_is_reported() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "clean");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    work_dir.write_file("asset.bin", "binary payload\n");
+
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Internal error: Failed to snapshot the working copy
+    Caused by:
+    1: git-lfs clean failed for asset.bin: fake git-lfs: forced failure for subcommand `clean`
+    2: git-lfs clean exited with status exit status: 17
+    [EOF]
+    [exit status: 255]
+    ");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_snapshot_lfs_preserves_executable_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "*.sh filter=lfs\n");
+    work_dir.write_file("tool.sh", "#!/bin/sh\necho hi\n");
+    let path = work_dir.root().join("tool.sh");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    std::fs::set_permissions(path, perms).unwrap();
+
+    let output = work_dir.run_jj(["diff", "--git"]);
+    insta::assert_snapshot!(output, @"
+    diff --git a/.gitattributes b/.gitattributes
+    new file mode 100644
+    index 0000000000..a93c303a94
+    --- /dev/null
+    +++ b/.gitattributes
+    @@ -0,0 +1,1 @@
+    +*.sh filter=lfs
+    diff --git a/tool.sh b/tool.sh
+    new file mode 100755
+    index 0000000000..7a1b75f64f
+    --- /dev/null
+    +++ b/tool.sh
+    @@ -0,0 +1,3 @@
+    +version https://git-lfs.github.com/spec/v1
+    +oid sha256:0000000000000000000000000000000000000000000000000000000000000012
+    +size 18
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_snapshot_lfs_deletion_is_tracked() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    work_dir.write_file("asset.bin", "payload\n");
+    work_dir.run_jj(["commit", "-m", "init"]).success();
+
+    work_dir.remove_file("asset.bin");
+    let status = work_dir.run_jj(["status"]);
+    assert!(
+        status.stdout.raw().contains("D asset.bin"),
+        "expected deletion in status, got:\n{status}"
+    );
+    let diff = work_dir.run_jj(["diff", "-s"]);
+    assert!(
+        diff.stdout.raw().contains("D asset.bin"),
+        "expected deletion in diff summary, got:\n{diff}"
+    );
 }
 
 #[test]

@@ -20,6 +20,7 @@ use insta::assert_snapshot;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::create_commit_with_files;
+use crate::common::set_up_fake_git_lfs;
 
 #[test]
 fn test_run_simple() {
@@ -68,7 +69,8 @@ fn test_run_simple() {
 
 #[test]
 fn test_run_gitattributes_filter_in_temp_snapshot() {
-    let test_env = TestEnvironment::default();
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let fake_formatter = assert_cmd::cargo::cargo_bin("fake-formatter");
     assert!(fake_formatter.is_file());
@@ -100,11 +102,14 @@ fn test_run_gitattributes_filter_in_temp_snapshot() {
     // This creates a legitimately tracked file by disabling filter ignores only
     // for setup. `jj run` then operates with normal settings. Its temporary
     // working copy is snapshotted after the command runs, and that snapshot must
-    // use the configured .gitattributes filters. Otherwise a command can rewrite
-    // a tracked LFS-filtered file even though normal snapshots would ignore it.
+    // use the configured .gitattributes filters.
     insta::assert_snapshot!(
         work_dir.run_jj(["file", "show", "-r", "@-", "file.bin"]).success().stdout,
-        @"original[EOF]"
+        @"
+        version https://git-lfs.github.com/spec/v1
+        oid sha256:0000000000000000000000000000000000000000000000000000000000000010
+        size 16
+        [EOF]"
     );
 }
 

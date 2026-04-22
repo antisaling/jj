@@ -17,10 +17,12 @@ use indoc::indoc;
 use testutils::TestResult;
 
 use crate::common::TestEnvironment;
+use crate::common::set_up_fake_git_lfs;
 
 #[test]
 fn test_diffedit_gitattributes_filter_in_temp_snapshot() -> TestResult {
     let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
     let edit_script = test_env.set_up_fake_diff_editor();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
@@ -47,12 +49,12 @@ fn test_diffedit_gitattributes_filter_in_temp_snapshot() -> TestResult {
     // ignores only for setup. `diffedit` then operates with normal settings.
     // Its external editor writes into a temporary output working copy, and
     // snapshotting that output must use the configured .gitattributes filters.
-    // Otherwise the editor can rewrite a tracked LFS-filtered file even though
-    // normal snapshots would ignore it.
     insta::assert_snapshot!(
         work_dir.run_jj(["file", "show", "file.bin"]).success().stdout,
         @r"
-    after
+    version https://git-lfs.github.com/spec/v1
+    oid sha256:0000000000000000000000000000000000000000000000000000000000000007
+    size 7
     [EOF]
     "
     );

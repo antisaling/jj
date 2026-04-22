@@ -448,6 +448,25 @@ impl GitAttributes {
         let value = value.as_ref().as_bstr();
         Ok(ignore_filters.iter().any(|state| value == state.as_str()))
     }
+
+    /// Returns whether the given `path` has `filter=lfs` in .gitattributes and
+    /// `lfs` is configured in `ignore_filters`.
+    pub(crate) async fn lfs_filter_matches(
+        &self,
+        path: &RepoPath,
+        ignore_filters: &HashSet<String>,
+        priority: SearchPriority,
+    ) -> bool {
+        let Ok(result) = self.search(path, ["filter"], priority).await else {
+            return false;
+        };
+
+        let Some(State::Value(value)) = result.get("filter") else {
+            return false;
+        };
+        let value = value.as_ref().as_bstr();
+        value == "lfs" && ignore_filters.iter().any(|state| value == state.as_str())
+    }
 }
 
 /// Errors for GitAttributes
@@ -968,6 +987,45 @@ mod tests {
                 .filter_matches(repo_path("file.txt"), filters, SearchPriority::Disk)
                 .block_on()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_gitattributes_lfs_filter_matches_only_lfs() {
+        let data = TestStore::from([(
+            repo_path(".gitattributes").to_owned(),
+            Ok(indoc! {"
+                *.bin filter=lfs
+                *.secret filter=git-crypt
+            "}
+            .to_string()),
+        )]);
+        let attributes = GitAttributes::new(HashMap::new(), data);
+        let filters = &HashSet::from(["lfs".to_string(), "git-crypt".to_string()]);
+
+        assert!(
+            attributes
+                .lfs_filter_matches(repo_path("file.bin"), filters, SearchPriority::Disk)
+                .block_on()
+        );
+        assert!(
+            attributes
+                .filter_matches(
+                    repo_path("credentials.secret"),
+                    filters,
+                    SearchPriority::Disk
+                )
+                .block_on()
+                .unwrap()
+        );
+        assert!(
+            !attributes
+                .lfs_filter_matches(
+                    repo_path("credentials.secret"),
+                    filters,
+                    SearchPriority::Disk
+                )
+                .block_on()
         );
     }
 }
