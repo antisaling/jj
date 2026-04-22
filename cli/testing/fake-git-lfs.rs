@@ -16,6 +16,14 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Read as _;
 use std::io::Write as _;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+#[cfg(unix)]
+use nix::sys::signal;
+#[cfg(unix)]
+use nix::unistd::getppid;
 
 fn append_log(subcommand: &str, args: &[String]) -> io::Result<()> {
     let Some(log_path) = std::env::var_os("FAKE_GIT_LFS_LOG") else {
@@ -61,6 +69,51 @@ fn run_clean() -> io::Result<()> {
     )
 }
 
+fn run_ls_files() -> io::Result<()> {
+    let state = std::env::var("FAKE_GIT_LFS_LS_FILES_STATE").unwrap_or_default();
+    match state.as_str() {
+        "missing" => writeln!(std::io::stdout(), "{} - tracked.bin", "0".repeat(64)),
+        "present" => writeln!(std::io::stdout(), "{} * tracked.bin", "0".repeat(64)),
+        _ => Ok(()),
+    }
+}
+
+fn block_until_released(subcommand: &str) -> io::Result<()> {
+    if std::env::var("FAKE_GIT_LFS_BLOCK_SUBCOMMAND")
+        .ok()
+        .as_deref()
+        != Some(subcommand)
+    {
+        return Ok(());
+    }
+    let Some(ready_path) = std::env::var_os("FAKE_GIT_LFS_READY_FILE") else {
+        return Ok(());
+    };
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(ready_path)?;
+    #[cfg(unix)]
+    if std::env::var("FAKE_GIT_LFS_CANCEL_PARENT").ok().as_deref() == Some("1") {
+        signal::kill(getppid(), signal::Signal::SIGINT).map_err(io::Error::other)?;
+    }
+    let Some(release_path) = std::env::var_os("FAKE_GIT_LFS_RELEASE_FILE") else {
+        return Ok(());
+    };
+    while !Path::new(&release_path).exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(done_path) = std::env::var_os("FAKE_GIT_LFS_DONE_FILE") {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(done_path)?;
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let mut args = std::env::args();
     let _program = args.next();
@@ -71,6 +124,7 @@ fn main() -> io::Result<()> {
     let remaining_args: Vec<String> = args.collect();
     require_git_context();
     append_log(&subcommand, &remaining_args)?;
+    block_until_released(&subcommand)?;
 
     if should_fail(&subcommand) {
         eprintln!("fake git-lfs: forced failure for subcommand `{subcommand}`");
@@ -79,6 +133,7 @@ fn main() -> io::Result<()> {
 
     match subcommand.as_str() {
         "clean" => run_clean(),
+        "ls-files" => run_ls_files(),
         "push" | "fetch" | "checkout" => Ok(()),
         _ => Ok(()),
     }

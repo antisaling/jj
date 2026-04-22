@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::io::Write as _;
+use std::thread;
+use std::time::Duration;
 
 use indoc::indoc;
 use testutils::TestResult;
@@ -22,6 +24,7 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::create_commit;
+use crate::common::set_up_fake_git_lfs;
 
 fn add_commit_to_branch(git_repo: &gix::Repository, branch: &str, message: &str) -> gix::ObjectId {
     // Get current commit ID of the branch if it exists
@@ -117,6 +120,11 @@ fn clone_git_remote_into(
         .unwrap();
 
     fork_repo
+}
+
+fn fake_git_lfs_log_has_subcommand(log: &str, subcommand: &str) -> bool {
+    log.lines()
+        .any(|line| line.starts_with(&format!("{subcommand}\t")))
 }
 
 #[test]
@@ -2655,4 +2663,239 @@ fn test_git_fetch_auto_track_bookmarks() {
     bookmark: not-mine/foo@origin [new] untracked
     [EOF]
     ");
+}
+
+#[test]
+fn test_git_fetch_non_lfs_ignore_filter_does_not_run_git_lfs() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["git-crypt"]"#);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    work_dir.run_jj(["git", "fetch"]).success();
+    let log = std::fs::read_to_string(&fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.trim().is_empty(),
+        "git-lfs should not have been invoked, but got:\n{log}"
+    );
+}
+
+#[test]
+fn test_git_fetch_lfs_non_colocated_uses_git_context() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_config(r#"remotes.origin.auto-track-bookmarks = "*""#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    let output = work_dir.run_jj(["git", "fetch"]).success();
+    assert!(
+        output.stdout.raw().is_empty(),
+        "Unexpected stdout from `jj git fetch`:\n{}",
+        output.stdout.raw()
+    );
+    let log = std::fs::read_to_string(&fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.lines().any(|line| line.starts_with("fetch\t")),
+        "git-lfs fetch should have been invoked, but got:\n{log}"
+    );
+    assert!(
+        log.lines().any(|line| line.starts_with("checkout\t")),
+        "git-lfs checkout should have been invoked, but got:\n{log}"
+    );
+}
+
+#[test]
+fn test_git_fetch_reports_lfs_transfer_failure() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_config(r#"remotes.origin.auto-track-bookmarks = "*""#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_FAIL_SUBCOMMAND", "fetch");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    let output = work_dir.run_jj(["git", "fetch"]);
+    assert!(
+        !output.status.success(),
+        "expected fetch to fail, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("`git-lfs fetch origin refs/remotes/origin/origin` failed with exit"),
+        "expected LFS failure in stderr, got:\n{output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_git_fetch_cancellation_during_lfs_keeps_jj_transaction() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_config(r#"remotes.origin.auto-track-bookmarks = "*""#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    let ready_path = test_env.env_root().join("lfs-fetch-ready");
+    let release_path = test_env.env_root().join("lfs-fetch-release");
+    let done_path = test_env.env_root().join("lfs-fetch-done");
+    test_env.add_env_var("FAKE_GIT_LFS_BLOCK_SUBCOMMAND", "fetch");
+    test_env.add_env_var("FAKE_GIT_LFS_CANCEL_PARENT", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_READY_FILE", &ready_path);
+    test_env.add_env_var("FAKE_GIT_LFS_RELEASE_FILE", &release_path);
+    test_env.add_env_var("FAKE_GIT_LFS_DONE_FILE", &done_path);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+    let operation_before_fetch = work_dir.current_operation_id();
+
+    let output = work_dir.run_jj(["git", "fetch"]);
+    let status = output.status;
+    assert!(!status.success(), "expected cancellation to stop jj");
+    assert!(ready_path.exists(), "jj did not reach the LFS fetch stage");
+    std::fs::write(&release_path, "").unwrap();
+    let lfs_exited = (0..200).any(|_| {
+        if done_path.exists() {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(lfs_exited, "fake git-lfs did not exit after release");
+
+    assert_ne!(
+        work_dir.current_operation_id(),
+        operation_before_fetch,
+        "fetch transaction was not committed before LFS cancellation"
+    );
+    let bookmarks = work_dir
+        .run_jj([
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "--quiet",
+            "--ignore-working-copy",
+        ])
+        .success();
+    assert!(
+        bookmarks.stdout.raw().contains("  @origin:"),
+        "fetched remote bookmark missing after LFS cancellation:\n{}",
+        bookmarks.stdout.raw()
+    );
+}
+
+#[test]
+fn test_git_fetch_lfs_noop_fetch_does_not_run_lfs_transfers() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    work_dir.run_jj(["git", "fetch"]).success();
+    std::fs::write(&fake_git_lfs_log_path, "").unwrap();
+
+    let second_output = work_dir.run_jj(["git", "fetch"]).success();
+    assert!(
+        second_output.stdout.raw().is_empty(),
+        "Unexpected stdout from second `jj git fetch`:\n{}",
+        second_output.stdout.raw()
+    );
+    let second_log = std::fs::read_to_string(&fake_git_lfs_log_path).unwrap();
+    assert!(
+        !fake_git_lfs_log_has_subcommand(&second_log, "fetch"),
+        "git-lfs fetch should not run on no-op fetch without missing local objects, but \
+         got:\n{second_log}"
+    );
+    assert!(
+        !fake_git_lfs_log_has_subcommand(&second_log, "checkout"),
+        "git-lfs checkout should not run on no-op fetch without missing local objects, but \
+         got:\n{second_log}"
+    );
+}
+
+#[test]
+fn test_git_fetch_lfs_noop_fetch_runs_lfs_transfers_if_objects_missing() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_LS_FILES_STATE", "missing");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    add_git_remote(&test_env, &work_dir, "origin");
+
+    work_dir.run_jj(["git", "fetch"]).success();
+    std::fs::write(&fake_git_lfs_log_path, "").unwrap();
+
+    let second_output = work_dir.run_jj(["git", "fetch"]).success();
+    assert!(
+        second_output.stdout.raw().is_empty(),
+        "Unexpected stdout from second `jj git fetch`:\n{}",
+        second_output.stdout.raw()
+    );
+    let second_log = std::fs::read_to_string(&fake_git_lfs_log_path).unwrap();
+    assert!(
+        fake_git_lfs_log_has_subcommand(&second_log, "fetch"),
+        "git-lfs fetch should run on no-op fetch when missing local objects are detected, but \
+         got:\n{second_log}"
+    );
+    assert!(
+        fake_git_lfs_log_has_subcommand(&second_log, "checkout"),
+        "git-lfs checkout should run on no-op fetch when missing local objects are detected, but \
+         got:\n{second_log}"
+    );
+}
+
+#[test]
+fn test_git_fetch_lfs_untracked_update_does_not_run_lfs_transfers() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let origin_repo = add_git_remote(&test_env, &work_dir, "origin");
+
+    work_dir.run_jj(["git", "fetch"]).success();
+    std::fs::write(&fake_git_lfs_log_path, "").unwrap();
+    add_commit_to_branch(&origin_repo, "origin", "updated");
+
+    let output = work_dir.run_jj(["git", "fetch"]).success();
+    assert!(
+        output.stdout.raw().is_empty(),
+        "Unexpected stdout from `jj git fetch`:\n{}",
+        output.stdout.raw()
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("bookmark: origin@origin [updated] untracked"),
+        "Expected untracked bookmark update in stderr, got:\n{}",
+        output.stderr.raw()
+    );
+
+    let log = std::fs::read_to_string(&fake_git_lfs_log_path).unwrap();
+    assert!(
+        !fake_git_lfs_log_has_subcommand(&log, "fetch"),
+        "git-lfs fetch should not run for untracked remote updates without missing local objects, \
+         but got:\n{log}"
+    );
+    assert!(
+        !fake_git_lfs_log_has_subcommand(&log, "checkout"),
+        "git-lfs checkout should not run for untracked remote updates without missing local \
+         objects, but got:\n{log}"
+    );
 }

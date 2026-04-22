@@ -18,6 +18,7 @@ use std::future;
 use std::io;
 use std::io::Write as _;
 use std::iter;
+use std::path::Path;
 use std::sync::Arc;
 
 use clap::ArgGroup;
@@ -37,6 +38,7 @@ use jj_lib::git::GitPushRefTargets;
 use jj_lib::git::GitSettings;
 use jj_lib::index::IndexResult;
 use jj_lib::merge::Diff;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::RefName;
@@ -258,6 +260,40 @@ const DEFAULT_REMOTE: &RemoteName = RemoteName::new("origin");
 
 const TX_DESC_PUSH: &str = "push ";
 
+fn lfs_refs_include_tracked_files(
+    lfs_git_dir: &Path,
+    lfs_worktree: &Path,
+    lfs_refs: &[String],
+) -> Result<bool, CommandError> {
+    for lfs_ref in lfs_refs {
+        let output = std::process::Command::new("git-lfs")
+            .arg("ls-files")
+            .arg(lfs_ref)
+            .env("GIT_DIR", lfs_git_dir)
+            .env("GIT_WORK_TREE", lfs_worktree)
+            .current_dir(lfs_worktree)
+            .output()
+            .map_err(|err| {
+                user_error_with_message(
+                    format!("Failed to execute `git-lfs ls-files {lfs_ref}`"),
+                    err,
+                )
+            })?;
+        if !output.status.success() {
+            return Err(user_error(format!(
+                "`git-lfs ls-files {lfs_ref}` failed with {}; aborting push to avoid dangling LFS \
+                 pointers",
+                output.status
+            )));
+        }
+        if output.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BookmarkMoveDirection {
     Forward,
@@ -277,6 +313,7 @@ pub async fn cmd_git_push(
         ));
     }
     let mut workspace_command = command.workspace_helper(ui).await?;
+    let wc_root = workspace_command.workspace_root().to_owned();
 
     let default_remote;
     let remote = if let Some(name) = &args.remote {
@@ -573,6 +610,56 @@ pub async fn cmd_git_push(
     }
 
     let git_settings = GitSettings::from_settings(tx.settings())?;
+
+    // jj passes --no-verify to git push, so the git-lfs pre-push hook never
+    // fires. Push LFS objects for the specific commits being pushed before
+    // sending the git refs so the remote never sees a dangling pointer.
+    let lfs_filter_enabled = git_settings
+        .ignore_filters
+        .iter()
+        .any(|filter| filter == "lfs");
+    if lfs_filter_enabled {
+        let git_backend = git::get_git_backend(tx.repo().store()).map_err(user_error)?;
+        let lfs_git_dir = git_backend.git_repo_path().to_owned();
+        let lfs_worktree = git_backend
+            .git_workdir()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| wc_root.clone());
+        let lfs_refs: Vec<String> = ref_updates
+            .bookmarks
+            .iter()
+            .chain(ref_updates.tags.iter())
+            .filter_map(|(_name, diff)| diff.after.as_ref())
+            .map(|id| id.hex())
+            .collect();
+        if !lfs_refs.is_empty()
+            && lfs_refs_include_tracked_files(&lfs_git_dir, &lfs_worktree, &lfs_refs)?
+        {
+            let mut cmd = std::process::Command::new("git-lfs");
+            cmd.arg("push").arg(remote.as_str());
+            for r in &lfs_refs {
+                cmd.arg(r);
+            }
+            let status = cmd
+                .env("GIT_DIR", &lfs_git_dir)
+                .env("GIT_WORK_TREE", &lfs_worktree)
+                .current_dir(&lfs_worktree)
+                .status()
+                .map_err(|err| {
+                    user_error_with_message(
+                        format!("Failed to execute `git-lfs push {}`", remote.as_symbol()),
+                        err,
+                    )
+                })?;
+            if !status.success() {
+                return Err(user_error(format!(
+                    "`git-lfs push` failed with {status}; aborting push to avoid dangling LFS \
+                     pointers"
+                )));
+            }
+        }
+    }
+
     let options = GitPushOptions {
         remote_push_options: args.option.clone(),
     };
