@@ -55,6 +55,11 @@ name = "fake-formatter"
 path = "testing/fake-formatter.rs"
 required-features = ["test-fakes"]
 
+[[bin]]
+name = "git-lfs"
+path = "testing/fake-git-lfs.rs"
+required-features = ["test-fakes"]
+
 [[test]]
 name = "runner"
 

@@ -3120,7 +3120,7 @@ fn test_always_store_empty_tree() -> TestResult {
 
 #[test_case(TestRepoBackend::Simple ; "simple backend")]
 #[test_case(TestRepoBackend::Git ; "git backend")]
-fn test_gitattributes_ignore_only_on_git_backend(backend: TestRepoBackend) -> TestResult {
+fn test_gitattributes_lfs_files_are_snapshotted(backend: TestRepoBackend) -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(backend);
     let workspace_root = test_workspace.workspace.workspace_root().to_owned();
 
@@ -3149,26 +3149,13 @@ fn test_gitattributes_ignore_only_on_git_backend(backend: TestRepoBackend) -> Te
             .is_present()
     );
 
-    match backend {
-        TestRepoBackend::Git => {
-            // Under Git backend, "file.txt" should be ignored
-            assert!(
-                new_tree
-                    .path_value(repo_path("file.txt"))
-                    .block_on()?
-                    .is_absent()
-            );
-        }
-        TestRepoBackend::Simple | TestRepoBackend::Test => {
-            // Under non-Git backends, "file.txt" should NOT be ignored
-            assert!(
-                new_tree
-                    .path_value(repo_path("file.txt"))
-                    .block_on()?
-                    .is_present()
-            );
-        }
-    }
+    // LFS files are stored as pointers under both backends.
+    assert!(
+        new_tree
+            .path_value(repo_path("file.txt"))
+            .block_on()?
+            .is_present()
+    );
 
     Ok(())
 }
@@ -3179,8 +3166,8 @@ fn test_gitattributes_ignore_only_on_git_backend(backend: TestRepoBackend) -> Te
 // when the disk file is missing. TreeState starts with an empty tree before
 // checkout, so caching GitAttributes there can leave the fallback pointed at
 // the empty tree even after checkout updates TreeState::tree. Removing the disk
-// .gitattributes file exercises that fallback; the tracked LFS file must keep
-// the tree contents instead of snapshotting the modified disk contents.
+// .gitattributes file exercises that fallback; the tracked LFS file should
+// snapshot the modified disk contents.
 #[test]
 fn test_gitattributes_use_store_fallback_after_checkout() -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
@@ -3204,7 +3191,7 @@ fn test_gitattributes_use_store_fallback_after_checkout() -> TestResult {
     std::fs::write(workspace_root.join("file.txt"), "modified\n")?;
 
     let new_tree = test_workspace.snapshot()?;
-    assert_eq!(
+    assert_ne!(
         new_tree.path_value(repo_path("file.txt")).block_on()?,
         tree.path_value(repo_path("file.txt")).block_on()?,
     );
@@ -3217,8 +3204,7 @@ fn test_gitattributes_use_store_fallback_after_checkout() -> TestResult {
 // Snapshot handles files that are present on disk and files that were deleted
 // from disk through separate paths. If deletion emission does not apply the
 // .gitattributes filter check, removing a tracked LFS-filtered file from disk
-// records a deletion even though normal snapshots would ignore changes to that
-// file. The tree should keep the tracked contents instead.
+// records a deletion in the snapshot.
 #[test]
 fn test_gitattributes_ignore_deleted_tracked_file() -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
@@ -3242,10 +3228,7 @@ fn test_gitattributes_ignore_deleted_tracked_file() -> TestResult {
     std::fs::remove_file(tracked_path.to_fs_path_unchecked(&workspace_root))?;
 
     let new_tree = test_workspace.snapshot()?;
-    assert_eq!(
-        new_tree.path_value(tracked_path).block_on()?,
-        tree.path_value(tracked_path).block_on()?,
-    );
+    assert!(new_tree.path_value(tracked_path).block_on()?.is_absent());
 
     Ok(())
 }
@@ -3256,8 +3239,8 @@ fn test_gitattributes_ignore_deleted_tracked_file() -> TestResult {
 // file. When .gitignore ignores an entire directory, snapshot uses a shortcut
 // that scans only already-tracked files in that directory. This test puts a
 // tracked file under that shortcut and marks it with filter=lfs. Modifying the
-// disk file must not update the tree: the .gitattributes filter should still
-// apply even though traversal used the ignored-directory path.
+// disk file should update the tree even though traversal used the ignored-
+// directory path.
 #[test]
 fn test_gitattributes_ignore_tracked_file_in_gitignored_dir() -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
@@ -3288,7 +3271,7 @@ fn test_gitattributes_ignore_tracked_file_in_gitignored_dir() -> TestResult {
 
     // The .gitattributes filter should still apply when .gitignore sends
     // tracked files through the ignored-directory shortcut.
-    assert_eq!(
+    assert_ne!(
         new_tree.path_value(tracked_path).block_on()?,
         tree.path_value(tracked_path).block_on()?,
     );
