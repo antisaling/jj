@@ -164,6 +164,18 @@ fn symlink_target_convert_to_disk(path: &str) -> PathBuf {
     PathBuf::from(path.as_ref())
 }
 
+fn lfs_pointer_oid(pointer_bytes: &[u8]) -> Option<&[u8]> {
+    for line in pointer_bytes.split(|&b| b == b'\n') {
+        if let Some(oid) = line.strip_prefix(b"oid sha256:")
+            && oid.len() == 64
+            && oid.iter().all(u8::is_ascii_hexdigit)
+        {
+            return Some(oid);
+        }
+    }
+    None
+}
+
 /// How to propagate executable bit changes in file metadata to/from the repo.
 ///
 /// On Windows, executable bits are always ignored, but on Unix they are
@@ -2402,6 +2414,38 @@ fn snapshot_error_for_mtime_out_of_range(err: MtimeOutOfRange, path: &Path) -> S
 /// Functions to update local-disk files from the store.
 impl TreeState {
     #[cfg(feature = "git")]
+    fn git_lfs_objects_dir(&self) -> Option<PathBuf> {
+        crate::git::get_git_backend(self.store.as_ref())
+            .ok()
+            .map(|git_backend| git_backend.git_repo_path().join("lfs").join("objects"))
+    }
+
+    #[cfg(not(feature = "git"))]
+    fn git_lfs_objects_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn pointer_has_local_lfs_object(
+        &self,
+        pointer_bytes: &[u8],
+        lfs_objects_dir: Option<&Path>,
+    ) -> bool {
+        let Some(lfs_objects_dir) = lfs_objects_dir else {
+            // Fall back to the previous behavior if we can't locate the shared
+            // Git LFS cache directory.
+            return true;
+        };
+        let Some(oid) = lfs_pointer_oid(pointer_bytes) else {
+            // Conservative fallback: if pointer parsing fails, let git-lfs
+            // checkout handle it.
+            return true;
+        };
+        let oid = String::from_utf8_lossy(oid).to_ascii_lowercase();
+        let object_path = lfs_objects_dir.join(&oid[0..2]).join(&oid[2..4]).join(&oid);
+        object_path.exists()
+    }
+
+    #[cfg(feature = "git")]
     fn configure_git_lfs_command<'a>(
         &'a self,
         command: &'a mut std::process::Command,
@@ -2618,6 +2662,7 @@ impl TreeState {
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
         let mut lfs_checkout_paths = Vec::new();
+        let lfs_objects_dir = self.git_lfs_objects_dir();
         let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
 
         let mut process_diff_entry = async |path: RepoPathBuf,
@@ -2777,7 +2822,11 @@ impl TreeState {
                             })?;
                             let mut pointer = header[..n].to_vec();
                             pointer.extend_from_slice(&rest);
-                            lfs_checkout_paths.push(path.as_internal_file_string().to_owned());
+                            if self
+                                .pointer_has_local_lfs_object(&pointer, lfs_objects_dir.as_deref())
+                            {
+                                lfs_checkout_paths.push(path.as_internal_file_string().to_owned());
+                            }
                             self.smudge_lfs_file(&disk_path, &pointer, exec_bit).await?
                         } else {
                             let contents = Cursor::new(header[..n].to_vec()).chain(file.reader);
