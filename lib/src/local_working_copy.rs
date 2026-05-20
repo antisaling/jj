@@ -164,6 +164,8 @@ fn symlink_target_convert_to_disk(path: &str) -> PathBuf {
     PathBuf::from(path.as_ref())
 }
 
+const LFS_POINTER_MAGIC: &[u8] = b"version https://git-lfs.github.com/spec";
+
 fn lfs_pointer_oid(pointer_bytes: &[u8]) -> Option<&[u8]> {
     for line in pointer_bytes.split(|&b| b == b'\n') {
         if let Some(oid) = line.strip_prefix(b"oid sha256:")
@@ -2471,7 +2473,7 @@ impl TreeState {
         command.current_dir(&self.working_copy_path)
     }
 
-    async fn smudge_lfs_file(
+    async fn write_lfs_pointer_file(
         &self,
         disk_path: &Path,
         pointer_bytes: &[u8],
@@ -2484,6 +2486,85 @@ impl TreeState {
             false,
         )
         .await
+    }
+
+    async fn smudge_lfs_pointer_to_file(
+        &self,
+        disk_path: &Path,
+        repo_path: &RepoPath,
+        pointer_bytes: &[u8],
+        exec_bit: ExecBit,
+    ) -> Result<FileState, CheckoutError> {
+        use std::io::Write as _;
+
+        let mut child_command = std::process::Command::new("git-lfs");
+        child_command
+            .arg("smudge")
+            .arg(repo_path.as_internal_file_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.configure_git_lfs_command(&mut child_command);
+        let mut child = child_command.spawn().map_err(|err| CheckoutError::Other {
+            message: "Failed to spawn git-lfs smudge".to_string(),
+            err: err.into(),
+        })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(pointer_bytes)
+                .map_err(|err| CheckoutError::Other {
+                    message: format!(
+                        "Failed to write LFS pointer content to git-lfs smudge for {}",
+                        disk_path.display()
+                    ),
+                    err: err.into(),
+                })?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|err| CheckoutError::Other {
+                message: "Failed to wait for git-lfs smudge".to_string(),
+                err: err.into(),
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(CheckoutError::Other {
+                message: format!(
+                    "git-lfs smudge failed for {}: {}",
+                    repo_path.as_internal_file_string(),
+                    stderr.trim()
+                ),
+                err: format!("git-lfs smudge exited with status {}", output.status).into(),
+            });
+        }
+        remove_old_file(disk_path)?;
+        self.write_file(disk_path, Cursor::new(output.stdout), exec_bit, false)
+            .await
+    }
+
+    fn disk_file_starts_with_lfs_pointer(&self, disk_path: &Path) -> Result<bool, CheckoutError> {
+        let mut file = File::open(disk_path).map_err(|err| CheckoutError::Other {
+            message: format!("Failed to open file {}", disk_path.display()),
+            err: err.into(),
+        })?;
+        let mut header = [0u8; 50];
+        let n = file.read(&mut header).map_err(|err| CheckoutError::Other {
+            message: format!("Failed to read file {}", disk_path.display()),
+            err: err.into(),
+        })?;
+        Ok(header[..n].starts_with(LFS_POINTER_MAGIC))
+    }
+
+    fn disk_file_state(
+        &self,
+        disk_path: &Path,
+        exec_bit: ExecBit,
+    ) -> Result<FileState, CheckoutError> {
+        let metadata = disk_path
+            .symlink_metadata()
+            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
+        FileState::for_file(exec_bit, metadata.len(), &metadata)
+            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
     }
 
     async fn write_file(
@@ -2651,6 +2732,13 @@ impl TreeState {
         new_tree: &MergedTree,
         matcher: &dyn Matcher,
     ) -> Result<CheckoutStats, CheckoutError> {
+        struct PendingLfsHydration {
+            path: RepoPathBuf,
+            disk_path: PathBuf,
+            pointer_bytes: Vec<u8>,
+            exec_bit: ExecBit,
+        }
+
         // TODO: maybe it's better not include the skipped counts in the "intended"
         // counts
         let mut stats = CheckoutStats {
@@ -2661,7 +2749,8 @@ impl TreeState {
         };
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
-        let mut lfs_checkout_paths = Vec::new();
+        let mut pending_lfs_hydrations = Vec::new();
+        let mut lfs_needs_fetch = false;
         let lfs_objects_dir = self.git_lfs_objects_dir();
         let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
 
@@ -2777,6 +2866,7 @@ impl TreeState {
             // the tree value because only the file states store the on-disk
             // executable bit.
             let get_prev_exec = || self.file_states().get_exec_bit(&path);
+            let mut pending_lfs_hydration = None;
 
             // TODO: Check that the file has not changed before overwriting/removing it.
             let file_state = match after {
@@ -2801,7 +2891,6 @@ impl TreeState {
                     let exec_bit =
                         ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
                     if self.ignore_filters.contains("lfs") {
-                        const LFS_MAGIC: &[u8] = b"version https://git-lfs.github.com/spec";
                         let mut header = [0u8; 50];
                         let n = file.reader.read(&mut header).await.map_err(|err| {
                             CheckoutError::Other {
@@ -2809,7 +2898,7 @@ impl TreeState {
                                 err: err.into(),
                             }
                         })?;
-                        if header[..n].starts_with(LFS_MAGIC) {
+                        if header[..n].starts_with(LFS_POINTER_MAGIC) {
                             let mut rest = Vec::new();
                             file.reader.read_to_end(&mut rest).await.map_err(|err| {
                                 CheckoutError::Other {
@@ -2822,12 +2911,19 @@ impl TreeState {
                             })?;
                             let mut pointer = header[..n].to_vec();
                             pointer.extend_from_slice(&rest);
-                            if self
+                            if !self
                                 .pointer_has_local_lfs_object(&pointer, lfs_objects_dir.as_deref())
                             {
-                                lfs_checkout_paths.push(path.as_internal_file_string().to_owned());
+                                lfs_needs_fetch = true;
                             }
-                            self.smudge_lfs_file(&disk_path, &pointer, exec_bit).await?
+                            pending_lfs_hydration = Some(PendingLfsHydration {
+                                path: path.clone(),
+                                disk_path: disk_path.clone(),
+                                pointer_bytes: pointer.clone(),
+                                exec_bit,
+                            });
+                            self.write_lfs_pointer_file(&disk_path, &pointer, exec_bit)
+                                .await?
                         } else {
                             let contents = Cursor::new(header[..n].to_vec()).chain(file.reader);
                             self.write_file(&disk_path, contents, exec_bit, true)
@@ -2895,6 +2991,9 @@ impl TreeState {
                 }
             };
             changed_file_states.push((path, file_state));
+            if let Some(pending_lfs_hydration) = pending_lfs_hydration {
+                pending_lfs_hydrations.push(pending_lfs_hydration);
+            }
             Ok(())
         };
 
@@ -2950,24 +3049,94 @@ impl TreeState {
             changed_file_states.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
         }
 
-        self.file_states
-            .merge_in(changed_file_states, &deleted_files);
-
-        if self.ignore_filters.contains("lfs") && !lfs_checkout_paths.is_empty() {
-            lfs_checkout_paths.sort_unstable();
-            lfs_checkout_paths.dedup();
-            const MAX_PATHS_PER_CHECKOUT: usize = 256;
-            for path_chunk in lfs_checkout_paths.chunks(MAX_PATHS_PER_CHECKOUT) {
+        if self.ignore_filters.contains("lfs") && !pending_lfs_hydrations.is_empty() {
+            if lfs_needs_fetch {
                 let mut command = std::process::Command::new("git-lfs");
                 command
-                    .arg("checkout")
-                    .args(path_chunk)
+                    .arg("fetch")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
                 self.configure_git_lfs_command(&mut command);
-                command.status().ok();
+                // TreeState has no Git ref to pass; per-file smudge below fetches the exact
+                // object.
+                drop(command.status());
+            }
+
+            let mut checkout_warning_printed = false;
+            let mut command = std::process::Command::new("git-lfs");
+            command
+                .arg("checkout")
+                // Excluded and missing LFS objects can emit one line per path.
+                // Keep automatic checkout quiet to avoid flooding command
+                // output.
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            self.configure_git_lfs_command(&mut command);
+            match command.status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    eprintln!(
+                        "warning: `git-lfs checkout` failed with {status}; falling back to \
+                         per-file LFS smudge for touched files"
+                    );
+                    checkout_warning_printed = true;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to execute `git-lfs checkout`: {err}; falling back to \
+                         per-file LFS smudge for touched files"
+                    );
+                    checkout_warning_printed = true;
+                }
+            }
+
+            let changed_file_state_indexes: HashMap<RepoPathBuf, usize> = changed_file_states
+                .iter()
+                .enumerate()
+                .map(|(index, (path, _file_state))| (path.clone(), index))
+                .collect();
+            let mut smudge_warning_printed = false;
+            for pending_lfs_hydration in pending_lfs_hydrations {
+                let index = changed_file_state_indexes[&pending_lfs_hydration.path];
+                let file_state =
+                    if self.disk_file_starts_with_lfs_pointer(&pending_lfs_hydration.disk_path)? {
+                        match self
+                            .smudge_lfs_pointer_to_file(
+                                &pending_lfs_hydration.disk_path,
+                                &pending_lfs_hydration.path,
+                                &pending_lfs_hydration.pointer_bytes,
+                                pending_lfs_hydration.exec_bit,
+                            )
+                            .await
+                        {
+                            Ok(file_state) => file_state,
+                            Err(err) => {
+                                if !smudge_warning_printed && !checkout_warning_printed {
+                                    eprintln!(
+                                        "warning: failed to hydrate some LFS pointer files via \
+                                         `git-lfs smudge`: {err}; LFS pointer files may remain in \
+                                         the working copy"
+                                    );
+                                    smudge_warning_printed = true;
+                                }
+                                self.disk_file_state(
+                                    &pending_lfs_hydration.disk_path,
+                                    pending_lfs_hydration.exec_bit,
+                                )?
+                            }
+                        }
+                    } else {
+                        self.disk_file_state(
+                            &pending_lfs_hydration.disk_path,
+                            pending_lfs_hydration.exec_bit,
+                        )?
+                    };
+                changed_file_states[index].1 = file_state;
             }
         }
+
+        self.file_states
+            .merge_in(changed_file_states, &deleted_files);
 
         Ok(stats)
     }

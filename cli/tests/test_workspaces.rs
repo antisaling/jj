@@ -125,7 +125,7 @@ fn test_workspaces_add_second_and_third_workspace() {
 }
 
 #[test]
-fn test_workspace_add_skips_lfs_checkout_when_objects_are_missing() {
+fn test_workspace_add_fetches_lfs_objects_then_runs_checkout_when_objects_are_missing() {
     let mut test_env = TestEnvironment::default();
     let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
     test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
@@ -135,7 +135,7 @@ fn test_workspace_add_skips_lfs_checkout_when_objects_are_missing() {
     ws1_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
     for i in 0..128 {
         ws1_dir.write_file(
-            &format!("generated_asset_{i:04}.bin"),
+            format!("generated_asset_{i:04}.bin"),
             format!("asset {i}\n"),
         );
     }
@@ -145,8 +145,31 @@ fn test_workspace_add_skips_lfs_checkout_when_objects_are_missing() {
     ws1_dir.run_jj(["workspace", "add", "../ws2"]).success();
     let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
     assert!(
-        !log.lines().any(|line| line.starts_with("checkout\t")),
-        "workspace add should avoid git-lfs checkout for missing local objects, but got:\n{log}"
+        log.lines().any(|line| line.starts_with("fetch\t")),
+        "workspace add should run git-lfs fetch for missing local objects, but got:\n{log}"
+    );
+    assert!(
+        log.lines().any(|line| line.starts_with("checkout\t")),
+        "workspace add should run git-lfs checkout after fetch, but got:\n{log}"
+    );
+    let fetch_pos = log.lines().position(|line| line.starts_with("fetch\t"));
+    let checkout_pos = log.lines().position(|line| line.starts_with("checkout\t"));
+    assert!(
+        matches!((fetch_pos, checkout_pos), (Some(fetch), Some(checkout)) if fetch < checkout),
+        "workspace add should run fetch before checkout, but got:\n{log}"
+    );
+    assert!(
+        log.lines().any(|line| line.starts_with("smudge\t")),
+        "workspace add should fall back to git-lfs smudge for touched pointers, but got:\n{log}"
+    );
+
+    let ws2_dir = test_env.work_dir("ws2");
+    let hydrated_bytes = std::fs::read(ws2_dir.root().join("generated_asset_0000.bin")).unwrap();
+    assert_eq!(hydrated_bytes.len(), "asset 0\n".len());
+    assert!(
+        !hydrated_bytes.starts_with(b"version https://git-lfs.github.com/spec/v1"),
+        "workspace add should hydrate the LFS pointer contents, but got:\n{}",
+        String::from_utf8_lossy(&hydrated_bytes)
     );
 }
 
