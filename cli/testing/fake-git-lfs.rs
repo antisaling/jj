@@ -114,6 +114,20 @@ fn block_until_released(subcommand: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn run_smudge() -> io::Result<()> {
+    let mut data = Vec::new();
+    std::io::stdin().read_to_end(&mut data)?;
+    let text = String::from_utf8_lossy(&data);
+    let Some(size) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("size ")?.parse::<usize>().ok())
+    else {
+        std::io::stdout().write_all(&data)?;
+        return Ok(());
+    };
+    std::io::stdout().write_all(&vec![b'X'; size])
+}
+
 fn main() -> io::Result<()> {
     let mut args = std::env::args();
     let _program = args.next();
@@ -133,6 +147,7 @@ fn main() -> io::Result<()> {
 
     match subcommand.as_str() {
         "clean" => run_clean(),
+        "smudge" => run_smudge(),
         "ls-files" => run_ls_files(),
         "push" | "fetch" | "checkout" => Ok(()),
         _ => Ok(()),
