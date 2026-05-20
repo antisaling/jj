@@ -76,6 +76,7 @@ use crate::command_error::cli_error_with_message;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::commands::git::get_single_remote;
+use crate::commands::git::lfs_transfers_enabled;
 use crate::complete;
 use crate::formatter::Formatter;
 use crate::git_util::GitSubprocessUi;
@@ -614,10 +615,7 @@ pub async fn cmd_git_push(
     // jj passes --no-verify to git push, so the git-lfs pre-push hook never
     // fires. Push LFS objects for the specific commits being pushed before
     // sending the git refs so the remote never sees a dangling pointer.
-    let lfs_filter_enabled = git_settings
-        .ignore_filters
-        .iter()
-        .any(|filter| filter == "lfs");
+    let lfs_filter_enabled = lfs_transfers_enabled(tx.settings())?;
     if lfs_filter_enabled {
         let git_backend = git::get_git_backend(tx.repo().store()).map_err(user_error)?;
         let lfs_git_dir = git_backend.git_repo_path().to_owned();
@@ -632,9 +630,14 @@ pub async fn cmd_git_push(
             .filter_map(|(_name, diff)| diff.after.as_ref())
             .map(|id| id.hex())
             .collect();
-        if !lfs_refs.is_empty()
-            && lfs_refs_include_tracked_files(&lfs_git_dir, &lfs_worktree, &lfs_refs)?
-        {
+        if !lfs_refs.is_empty() && {
+            writeln!(
+                ui.status(),
+                "Running `git-lfs ls-files` to detect LFS content in outgoing commits"
+            )?;
+            lfs_refs_include_tracked_files(&lfs_git_dir, &lfs_worktree, &lfs_refs)?
+        } {
+            writeln!(ui.status(), "Running `git-lfs push {}`", remote.as_symbol())?;
             let mut cmd = std::process::Command::new("git-lfs");
             cmd.arg("push").arg(remote.as_str());
             for r in &lfs_refs {

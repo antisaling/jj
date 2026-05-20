@@ -41,8 +41,8 @@ use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::user_error;
-use crate::command_error::user_error_with_message;
 use crate::commands::git::get_single_remote;
+use crate::commands::git::lfs_transfers_enabled;
 use crate::complete;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::load_git_import_options;
@@ -239,10 +239,7 @@ pub async fn cmd_git_fetch(
     }
 
     let git_settings = GitSettings::from_settings(tx.settings())?;
-    let lfs_git_context = git_settings
-        .ignore_filters
-        .iter()
-        .any(|filter| filter == "lfs")
+    let lfs_git_context = lfs_transfers_enabled(tx.settings())?
         .then(|| {
             let git_backend = get_git_backend(tx.repo().store())?;
             let git_worktree = git_backend
@@ -320,8 +317,20 @@ pub async fn cmd_git_fetch(
     // LFS runs after the transaction is committed so cancellation doesn't
     // leave jj in a stale state (git refs are already persisted by this point).
     if let Some((git_dir, git_worktree)) = lfs_git_context {
-        let missing_local_lfs_objects =
-            lfs_fetch_refs.is_empty() && has_missing_local_lfs_objects(&git_dir, &git_worktree);
+        let missing_local_lfs_objects = if lfs_fetch_refs.is_empty() {
+            match has_missing_local_lfs_objects(&git_dir, &git_worktree) {
+                Ok(missing) => missing,
+                Err(message) => {
+                    writeln!(
+                        ui.warning_default(),
+                        "{message}; running LFS transfers anyway."
+                    )?;
+                    true
+                }
+            }
+        } else {
+            false
+        };
         if !lfs_fetch_refs.is_empty() || missing_local_lfs_objects {
             for remote in &matching_remotes {
                 let refs: Vec<&str> = lfs_fetch_refs
@@ -341,18 +350,9 @@ pub async fn cmd_git_fetch(
                 } else {
                     args.extend(refs);
                 }
-                run_git_lfs_command(&git_dir, &git_worktree, &args)?;
+                run_optional_git_lfs_command(ui, &git_dir, &git_worktree, &args)?;
             }
-            // Keep automatic checkout quiet for excluded/missing objects.
-            std::process::Command::new("git-lfs")
-                .arg("checkout")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .env("GIT_DIR", &git_dir)
-                .env("GIT_WORK_TREE", &git_worktree)
-                .current_dir(&git_worktree)
-                .status()
-                .ok();
+            run_optional_git_lfs_command(ui, &git_dir, &git_worktree, &["checkout"])?;
         }
     }
 
@@ -360,27 +360,6 @@ pub async fn cmd_git_fetch(
 }
 
 const DEFAULT_REMOTE: &RemoteName = RemoteName::new("origin");
-
-fn run_git_lfs_command(
-    git_dir: &Path,
-    git_worktree: &Path,
-    args: &[&str],
-) -> Result<(), CommandError> {
-    let description = format!("`git-lfs {}`", args.join(" "));
-    let status = std::process::Command::new("git-lfs")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("GIT_DIR", git_dir)
-        .env("GIT_WORK_TREE", git_worktree)
-        .current_dir(git_worktree)
-        .status()
-        .map_err(|err| user_error_with_message(format!("Failed to execute {description}"), err))?;
-    if !status.success() {
-        return Err(user_error(format!("{description} failed with {status}")));
-    }
-    Ok(())
-}
 
 fn git_config_string(git_dir: &Path, git_worktree: &Path, key: &str) -> Option<String> {
     let output = std::process::Command::new("git")
@@ -399,7 +378,41 @@ fn git_config_string(git_dir: &Path, git_worktree: &Path, key: &str) -> Option<S
     (!value.is_empty()).then_some(value)
 }
 
-fn has_missing_local_lfs_objects(git_dir: &Path, git_worktree: &Path) -> bool {
+fn run_optional_git_lfs_command(
+    ui: &mut Ui,
+    git_dir: &Path,
+    git_worktree: &Path,
+    args: &[&str],
+) -> io::Result<()> {
+    let command_name = format!("git-lfs {}", args.join(" "));
+    writeln!(ui.status(), "Running `{command_name}`")?;
+    let status = std::process::Command::new("git-lfs")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", git_worktree)
+        .current_dir(git_worktree)
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            writeln!(
+                ui.warning_default(),
+                "`{command_name}` failed with {status}; continuing."
+            )?;
+        }
+        Err(err) => {
+            writeln!(
+                ui.warning_default(),
+                "Failed to execute `{command_name}`: {err}; continuing."
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn has_missing_local_lfs_objects(git_dir: &Path, git_worktree: &Path) -> Result<bool, String> {
     let mut command = std::process::Command::new("git-lfs");
     command
         .args(["ls-files", "--long"])
@@ -415,16 +428,19 @@ fn has_missing_local_lfs_objects(git_dir: &Path, git_worktree: &Path) -> bool {
         command.arg(format!("--exclude={exclude}"));
     }
 
-    let Ok(output) = command.output() else {
-        return false;
-    };
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to execute `git-lfs ls-files --long`: {err}"))?;
     if !output.status.success() {
-        return false;
+        return Err(format!(
+            "`git-lfs ls-files --long` failed with {}",
+            output.status
+        ));
     }
 
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line.split_whitespace().nth(1) == Some("-"))
+        .any(|line| line.split_whitespace().nth(1) == Some("-")))
 }
 
 fn get_default_fetch_remotes(

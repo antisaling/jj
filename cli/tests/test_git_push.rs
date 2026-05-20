@@ -2934,6 +2934,13 @@ fn test_git_push_aborts_when_lfs_upload_fails() {
         output
             .stderr
             .raw()
+            .contains("Running `git-lfs push origin`"),
+        "expected push output to announce git-lfs push, got:\n{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
             .contains("`git-lfs push` failed with exit")
             && output
                 .stderr
@@ -3071,9 +3078,23 @@ fn test_git_push_non_colocated_skips_lfs_upload_when_refs_have_no_lfs_files() {
     work_dir.write_file("file", "file");
     work_dir.run_jj(["bookmark", "move", "bookmark1"]).success();
 
-    work_dir
+    let output = work_dir
         .run_jj(["git", "push", "--bookmark", "bookmark1"])
         .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Running `git-lfs ls-files` to detect LFS content in outgoing commits"),
+        "expected push output to announce git-lfs ls-files check, got:\n{output}"
+    );
+    assert!(
+        !output
+            .stderr
+            .raw()
+            .contains("Running `git-lfs push origin`"),
+        "git-lfs push should not be announced when refs have no LFS files, got:\n{output}"
+    );
     let bookmark_output = get_bookmark_output(&work_dir).stdout.into_raw();
     assert!(
         !bookmark_output.contains("@origin (behind by 1 commits)"),
