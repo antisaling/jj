@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::slice;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::channel;
@@ -1388,6 +1389,7 @@ impl TreeState {
                 progress: *progress,
                 max_new_file_size: *max_new_file_size,
                 git_attributes,
+                maybe_changed_gitattributes_dirs: Mutex::new(HashMap::new()),
                 ignore_filters: self.ignore_filters.clone(),
             };
             let directory_to_visit = DirectoryToVisit {
@@ -1562,6 +1564,7 @@ struct FileSnapshotter<'a> {
     max_new_file_size: u64,
 
     git_attributes: Arc<GitAttributes>,
+    maybe_changed_gitattributes_dirs: Mutex<HashMap<RepoPathBuf, bool>>,
     ignore_filters: HashSet<String>,
 }
 
@@ -1587,6 +1590,94 @@ impl FileSnapshotter<'_> {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    async fn maybe_changed_gitattributes_in_directory(
+        &self,
+        dir: &RepoPath,
+    ) -> Result<bool, SnapshotError> {
+        if let Some(changed) = self
+            .maybe_changed_gitattributes_dirs
+            .lock()
+            .expect("not poisoned")
+            .get(dir)
+            .copied()
+        {
+            return Ok(changed);
+        }
+        let mut paths = Vec::new();
+        let mut current = dir;
+        let mut changed = false;
+        loop {
+            if let Some(parent_changed) = self
+                .maybe_changed_gitattributes_dirs
+                .lock()
+                .expect("not poisoned")
+                .get(current)
+                .copied()
+            {
+                changed = parent_changed;
+                break;
+            }
+            paths.push(current.to_owned());
+            current = match current.parent() {
+                Some(parent) => parent,
+                None => break,
+            };
+        }
+        for path in paths.into_iter().rev() {
+            changed |= self.gitattributes_changed_in_directory(&path).await?;
+            self.maybe_changed_gitattributes_dirs
+                .lock()
+                .expect("not poisoned")
+                .insert(path, changed);
+        }
+        Ok(changed)
+    }
+
+    async fn gitattributes_changed_in_directory(
+        &self,
+        dir: &RepoPath,
+    ) -> Result<bool, SnapshotError> {
+        let name = RepoPathComponent::new(".gitattributes").expect("valid path component");
+        let path = dir.join(name);
+        let disk_path = path.to_fs_path(&self.tree_state.working_copy_path)?;
+        let disk_contents = match fs::read(&disk_path) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(SnapshotError::Other {
+                    message: format!("Failed to read file {}", disk_path.display()),
+                    err: err.into(),
+                });
+            }
+        };
+        let Some(disk_contents) = disk_contents else {
+            return Ok(false);
+        };
+        let current_tree_value = self.current_tree.path_value(&path).await?;
+        let current_contents = if let Some(file_id) = current_tree_value
+            .to_file_merge()
+            .as_ref()
+            .and_then(|files| files.resolve_trivial(SameChange::Accept))
+            .and_then(|file| file.as_ref())
+        {
+            let mut file = self.store().read_file(&path, file_id).await?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)
+                .await
+                .map_err(|err| SnapshotError::Other {
+                    message: format!(
+                        "Failed to read file {} from the current tree",
+                        path.as_internal_file_string()
+                    ),
+                    err: err.into(),
+                })?;
+            Some(contents)
+        } else {
+            None
+        };
+        Ok(Some(disk_contents) != current_contents)
     }
 
     /// Visits the directory entries, spawns jobs to recurse into sub
@@ -1713,9 +1804,11 @@ impl FileSnapshotter<'_> {
                 if let Some(new_file_state) = file_state(&metadata)
                     .map_err(|err| snapshot_error_for_mtime_out_of_range(err, &entry.path()))?
                 {
-                    if new_file_state.is_clean(current_file_state)
-                        && current_file_state.mtime < self.tree_state.own_mtime
-                    {
+                    let clean = new_file_state.is_clean(current_file_state)
+                        && current_file_state.mtime < self.tree_state.own_mtime;
+                    let gitattributes_changed =
+                        self.maybe_changed_gitattributes_in_directory(dir).await?;
+                    if clean && !gitattributes_changed {
                         return Ok(Some((PresentDirEntryKind::File, name_string)));
                     }
                     let filter_matches = self
@@ -1723,7 +1816,7 @@ impl FileSnapshotter<'_> {
                         .filter_matches(&path, &self.ignore_filters, SearchPriority::Disk)
                         .block_on()?;
                     if filter_matches {
-                        if self.ignore_filters.contains("lfs")
+                        let lfs_filter_matches = self.ignore_filters.contains("lfs")
                             && self
                                 .git_attributes
                                 .lfs_filter_matches(
@@ -1731,13 +1824,21 @@ impl FileSnapshotter<'_> {
                                     &self.ignore_filters,
                                     SearchPriority::Disk,
                                 )
-                                .block_on()
-                        {
+                                .block_on();
+                        let force_resnapshot = clean
+                            && gitattributes_changed
+                            && lfs_filter_matches
+                            && !self.current_tree_uses_lfs_pointer(&path).await?;
+                        if clean && !force_resnapshot {
+                            return Ok(Some((PresentDirEntryKind::File, name_string)));
+                        }
+                        if lfs_filter_matches {
                             self.snapshot_lfs_file(
                                 &path,
                                 &entry.path(),
                                 Some(current_file_state),
                                 new_file_state,
+                                force_resnapshot,
                             )
                             .await?;
                         } else {
@@ -1745,6 +1846,9 @@ impl FileSnapshotter<'_> {
                             return Ok(None);
                         }
                     } else {
+                        if clean {
+                            return Ok(Some((PresentDirEntryKind::File, name_string)));
+                        }
                         self.process_present_file(
                             path,
                             &entry.path(),
@@ -1790,7 +1894,7 @@ impl FileSnapshotter<'_> {
                     if let Some(new_file_state) = file_state(&metadata)
                         .map_err(|err| snapshot_error_for_mtime_out_of_range(err, &entry.path()))?
                     {
-                        self.snapshot_lfs_file(&path, &entry.path(), None, new_file_state)
+                        self.snapshot_lfs_file(&path, &entry.path(), None, new_file_state, false)
                             .await?;
                         Ok(Some((PresentDirEntryKind::File, name_string)))
                     } else {
@@ -1870,9 +1974,13 @@ impl FileSnapshotter<'_> {
                 self.deleted_files_tx.send(tracked_path.to_owned()).ok();
                 continue;
             };
-            if new_file_state.is_clean(&current_file_state)
-                && current_file_state.mtime < self.tree_state.own_mtime
-            {
+            let clean = new_file_state.is_clean(&current_file_state)
+                && current_file_state.mtime < self.tree_state.own_mtime;
+            let parent_dir = tracked_path.parent().unwrap_or(RepoPath::root());
+            let gitattributes_changed = self
+                .maybe_changed_gitattributes_in_directory(parent_dir)
+                .await?;
+            if clean && !gitattributes_changed {
                 continue;
             }
 
@@ -1881,7 +1989,7 @@ impl FileSnapshotter<'_> {
                 .filter_matches(tracked_path, &self.ignore_filters, SearchPriority::Disk)
                 .await?;
             if filter_matches {
-                if self.ignore_filters.contains("lfs")
+                let lfs_filter_matches = self.ignore_filters.contains("lfs")
                     && self
                         .git_attributes
                         .lfs_filter_matches(
@@ -1889,17 +1997,29 @@ impl FileSnapshotter<'_> {
                             &self.ignore_filters,
                             SearchPriority::Disk,
                         )
-                        .await
-                {
+                        .await;
+                let force_resnapshot = clean
+                    && gitattributes_changed
+                    && lfs_filter_matches
+                    && !self.current_tree_uses_lfs_pointer(tracked_path).await?;
+                if clean && !force_resnapshot {
+                    continue;
+                }
+                if lfs_filter_matches {
+                    // LFS-filtered tracked file: update via git-lfs clean.
                     self.snapshot_lfs_file(
                         tracked_path,
                         &disk_path,
                         Some(&current_file_state),
                         new_file_state,
+                        force_resnapshot,
                     )
                     .await?;
                 }
             } else {
+                if clean {
+                    continue;
+                }
                 self.process_present_file(
                     tracked_path.to_owned(),
                     &disk_path,
@@ -1918,8 +2038,10 @@ impl FileSnapshotter<'_> {
         disk_path: &Path,
         maybe_current_file_state: Option<&FileState>,
         new_file_state: FileState,
+        force_resnapshot: bool,
     ) -> Result<(), SnapshotError> {
-        if let Some(current) = maybe_current_file_state
+        if !force_resnapshot
+            && let Some(current) = maybe_current_file_state
             && new_file_state.is_clean(current)
             && current.mtime < self.tree_state.own_mtime
         {
@@ -1968,14 +2090,15 @@ impl FileSnapshotter<'_> {
             err: err.into(),
         })?;
 
-        const LFS_MAGIC: &[u8] = b"version https://git-lfs.github.com/spec";
+        // Peek to detect existing LFS pointer vs raw content.
         let mut header = [0u8; 50];
         let n = file.read(&mut header).map_err(|err| SnapshotError::Other {
             message: format!("Failed to read file {}", disk_path.display()),
             err: err.into(),
         })?;
 
-        let pointer_bytes = if header[..n].starts_with(LFS_MAGIC) {
+        let pointer_bytes: Vec<u8> = if header[..n].starts_with(LFS_POINTER_MAGIC) {
+            // Already an LFS pointer — store as-is.
             let mut rest = Vec::new();
             file.read_to_end(&mut rest)
                 .map_err(|err| SnapshotError::Other {
@@ -2347,6 +2470,34 @@ impl FileSnapshotter<'_> {
                 err: err.into(),
             })?;
         Ok(self.store().write_file(path, &mut contents).await?)
+    }
+
+    async fn current_tree_uses_lfs_pointer(
+        &self,
+        repo_path: &RepoPath,
+    ) -> Result<bool, SnapshotError> {
+        let current_tree_value = self.current_tree.path_value(repo_path).await?;
+        let file_merge = current_tree_value.to_file_merge();
+        let Some(file_id) = file_merge
+            .as_ref()
+            .and_then(|files| files.resolve_trivial(SameChange::Accept))
+            .and_then(|file| file.as_ref())
+        else {
+            return Ok(false);
+        };
+        let mut file = self.store().read_file(repo_path, file_id).await?;
+        let mut header = [0u8; 50];
+        let n = file
+            .read(&mut header)
+            .await
+            .map_err(|err| SnapshotError::Other {
+                message: format!(
+                    "Failed to read file {} from the current tree",
+                    repo_path.as_internal_file_string()
+                ),
+                err: err.into(),
+            })?;
+        Ok(header[..n].starts_with(LFS_POINTER_MAGIC))
     }
 
     async fn write_symlink_to_store(
