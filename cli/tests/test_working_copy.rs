@@ -215,6 +215,54 @@ fn test_snapshot_lfs_clean_failure_is_reported() {
     ");
 }
 
+#[test]
+fn test_snapshot_tracked_file_switches_to_lfs_after_gitattributes_change() {
+    let mut test_env = TestEnvironment::default();
+    let fake_git_lfs_log_path = set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("asset.bin", "binary payload\n");
+    work_dir.run_jj(["commit", "-m", "before lfs"]).success();
+
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    let output = work_dir.run_jj(["diff", "--git"]);
+    let stdout = output.stdout.raw();
+    assert!(
+        stdout.contains("diff --git a/.gitattributes b/.gitattributes"),
+        "expected .gitattributes diff, got:\n{output}"
+    );
+    assert!(
+        stdout.contains("diff --git a/asset.bin b/asset.bin"),
+        "expected asset.bin diff, got:\n{output}"
+    );
+    assert!(
+        stdout.contains("-binary payload"),
+        "expected raw asset removal, got:\n{output}"
+    );
+    assert!(
+        stdout.contains("+version https://git-lfs.github.com/spec/v1"),
+        "expected LFS pointer in diff, got:\n{output}"
+    );
+    assert!(
+        stdout.contains(
+            "+oid sha256:000000000000000000000000000000000000000000000000000000000000000f"
+        ),
+        "expected fake git-lfs oid in diff, got:\n{output}"
+    );
+    assert!(
+        stdout.contains("+size 15"),
+        "expected fake git-lfs size in diff, got:\n{output}"
+    );
+
+    let log = std::fs::read_to_string(fake_git_lfs_log_path).unwrap();
+    assert!(
+        log.contains("clean\t--\tasset.bin"),
+        "expected git-lfs clean to run for tracked file after .gitattributes change, got:\n{log}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_snapshot_lfs_preserves_executable_mode() {

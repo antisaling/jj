@@ -3219,11 +3219,8 @@ fn test_gitattributes_lfs_files_are_snapshotted(backend: TestRepoBackend) -> Tes
 // Regression test for a bug found during development.
 //
 // Snapshot prefers .gitattributes from disk but falls back to the current tree
-// when the disk file is missing. TreeState starts with an empty tree before
-// checkout, so caching GitAttributes there can leave the fallback pointed at
-// the empty tree even after checkout updates TreeState::tree. Removing the disk
-// .gitattributes file exercises that fallback; the tracked LFS file should
-// snapshot the modified disk contents.
+// when the disk file is missing. Removing the disk .gitattributes file
+// exercises that fallback while the modified tracked file is observed.
 #[test]
 fn test_gitattributes_use_store_fallback_after_checkout() -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
@@ -3260,7 +3257,8 @@ fn test_gitattributes_use_store_fallback_after_checkout() -> TestResult {
 // Snapshot handles files that are present on disk and files that were deleted
 // from disk through separate paths. If deletion emission does not apply the
 // .gitattributes filter check, removing a tracked LFS-filtered file from disk
-// records a deletion in the snapshot.
+// records a deletion even though normal snapshots would ignore changes to that
+// file. The deletion should be reflected in the snapshot.
 #[test]
 fn test_gitattributes_ignore_deleted_tracked_file() -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
