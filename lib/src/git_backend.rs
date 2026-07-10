@@ -43,6 +43,7 @@ use gix::objs::CommitRefIter;
 use gix::objs::Exists as _;
 use gix::objs::Write as _;
 use gix::objs::WriteTo as _;
+use gix::objs::commit::signature_field_name;
 use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
@@ -155,6 +156,19 @@ impl From<GitBackendError> for BackendError {
     fn from(err: GitBackendError) -> Self {
         Self::Other(err.into())
     }
+}
+
+#[derive(Debug, Error)]
+pub enum GitRepoAtWorkdirError {
+    #[error("No Git repository found at {path}")]
+    NotFound {
+        path: PathBuf,
+        source: gix::discover::is_git::Error,
+    },
+    #[error("Unrelated Git repository found at {path}")]
+    Unrelated { path: PathBuf },
+    #[error("Failed to open Git repository")]
+    Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 #[derive(Debug, Error)]
@@ -352,19 +366,54 @@ impl GitBackend {
         self.repo.lock().unwrap()
     }
 
-    /// Returns new thread-local instance to access to the underlying Git repo.
+    /// Returns a new thread-local handle for the underlying Git repository.
+    ///
+    /// Use [`Self::open_git_repo_at_workdir()`] for worktree operations.
     pub fn git_repo(&self) -> gix::Repository {
         self.base_repo.to_thread_local()
+    }
+
+    /// Reopens the repository at the given workspace path. Returns a new
+    /// thread-local handle.
+    pub fn open_git_repo_at_workdir(
+        &self,
+        path: &Path,
+    ) -> Result<gix::Repository, GitRepoAtWorkdirError> {
+        // Try the open repository first.
+        let open_repo = self.git_repo();
+        if let Some(workdir) = open_repo.workdir()
+            && (workdir == path || dunce::canonicalize(path).is_ok_and(|path| workdir == path))
+        {
+            return Ok(open_repo);
+        }
+
+        // The input path doesn't include ".git".
+        let opts = open_repo.open_options().clone().open_path_as_is(false);
+        let work_repo = gix::ThreadSafeRepository::open_opts(path, opts)
+            .map_err(|err| match err {
+                gix::open::Error::NotARepository { path, source } => {
+                    GitRepoAtWorkdirError::NotFound { path, source }
+                }
+                err => GitRepoAtWorkdirError::Other(err.into()),
+            })?
+            .to_thread_local();
+        let canonicalize = |path: &Path| {
+            dunce::canonicalize(path).map_err(|err| GitRepoAtWorkdirError::Other(err.into()))
+        };
+        if open_repo.common_dir() == work_repo.common_dir()
+            || canonicalize(open_repo.common_dir())? == canonicalize(work_repo.common_dir())?
+        {
+            // The last (path, work_repo) can be cached if needed.
+            Ok(work_repo)
+        } else {
+            let path = path.to_owned();
+            Err(GitRepoAtWorkdirError::Unrelated { path })
+        }
     }
 
     /// Path to the `.git` directory or the repository itself if it's bare.
     pub fn git_repo_path(&self) -> &Path {
         self.base_repo.path()
-    }
-
-    /// Path to the working directory if the repository isn't bare.
-    pub fn git_workdir(&self) -> Option<&Path> {
-        self.base_repo.work_dir()
     }
 
     fn shallow_root_ids(&self, git_repo: &gix::Repository) -> BackendResult<&[CommitId]> {
@@ -680,8 +729,7 @@ fn commit_from_git_without_root_parent(
     let secure_sig = commit
         .extra_headers
         .iter()
-        // gix does not recognize gpgsig-sha256, but prevent future footguns by checking for it too
-        .any(|(k, _)| *k == "gpgsig" || *k == "gpgsig-sha256")
+        .any(|(k, _)| *k == signature_field_name(git_object.id.kind()))
         .then(|| CommitRefIter::signature(&git_object.data, git_object.id.kind()))
         .transpose()
         .map_err(decode_err)?
@@ -1376,9 +1424,10 @@ impl Backend for GitBackend {
                     object_type: "commit",
                     source: Box::new(err),
                 })?;
+                let field = signature_field_name(git_tree_id.kind());
                 commit
                     .extra_headers
-                    .push(("gpgsig".into(), sig.clone().into()));
+                    .push((field.into(), sig.clone().into()));
                 contents.secure_sig = Some(SecureSig { data, sig });
             }
 
@@ -1654,6 +1703,48 @@ mod tests {
         .to_thread_local()
     }
 
+    #[test]
+    fn open_git_repo_at_workdir() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+
+        let git_repo_path = temp_dir.path().join("git1");
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
+        let other_git_repo_path = temp_dir.path().join("git2");
+        let _other_git_repo = git_init(&other_git_repo_path, gix::hash::Kind::default());
+
+        let worktree_dir = temp_dir.path().join("git1-wt");
+        let output = Command::new("git")
+            .args(["worktree", "add", "--orphan"])
+            .arg(&worktree_dir)
+            .current_dir(&git_repo_path)
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        assert_matches!(
+            backend.open_git_repo_at_workdir(&git_repo_path),
+            Ok(repo) if repo.workdir() == Some(backend.git_repo().workdir().unwrap())
+        );
+        assert_matches!(
+            backend.open_git_repo_at_workdir(&worktree_dir),
+            Ok(repo) if repo.workdir() == Some(worktree_dir.as_ref())
+        );
+        assert_matches!(
+            backend.open_git_repo_at_workdir(&temp_dir.path().join("unknown")),
+            Err(GitRepoAtWorkdirError::NotFound { .. })
+        );
+        assert_matches!(
+            backend.open_git_repo_at_workdir(&other_git_repo_path),
+            Err(GitRepoAtWorkdirError::Unrelated { .. })
+        );
+
+        Ok(())
+    }
+
     #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
     #[test_case(gix::hash::Kind::Sha256; "sha256")]
     fn read_plain_git_commit(object_hash: gix::hash::Kind) -> TestResult {
@@ -1896,10 +1987,8 @@ mod tests {
         commit.write_to(&mut commit_buf)?;
         let commit_str = str::from_utf8(&commit_buf)?;
 
-        commit
-            .extra_headers
-            // TODO: should this conditionally become gpgsig-sha256 once gix supports it?
-            .push(("gpgsig".into(), secure_sig.into()));
+        let field = signature_field_name(object_hash);
+        commit.extra_headers.push((field.into(), secure_sig.into()));
 
         let git_commit_id = git_repo.write_object(&commit)?;
 
@@ -2439,7 +2528,7 @@ mod tests {
         author Someone <someone@example.com> 0 +0000
         committer Someone <someone@example.com> 0 +0000
         change-id xpxpxpxpxpxpxpxpxpxpxpxpxpxpxpxp
-        gpgsig test sig
+        gpgsig-sha256 test sig
          hash=d6219e8e5169d409d115848dea4556b3accc76f3cd8dc9b128cc3fe9f71adae275f0e6ce9f98c581a89b960863b61c61b6479cdc20806009d63aecaaa82f4590
 
         initial

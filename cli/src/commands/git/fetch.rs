@@ -243,8 +243,9 @@ pub async fn cmd_git_fetch(
         .then(|| {
             let git_backend = get_git_backend(tx.repo().store())?;
             let git_worktree = git_backend
-                .git_workdir()
-                .map(PathBuf::from)
+                .open_git_repo_at_workdir(&wc_root)
+                .ok()
+                .and_then(|git_repo| git_repo.workdir().map(PathBuf::from))
                 .unwrap_or_else(|| wc_root.clone());
             Ok::<_, CommandError>((git_backend.git_repo_path().to_owned(), git_worktree))
         })

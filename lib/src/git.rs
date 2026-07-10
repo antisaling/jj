@@ -23,6 +23,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::iter;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -93,6 +94,10 @@ const REMOTE_BOOKMARK_REF_NAMESPACE: &str = "refs/remotes/";
 /// Git ref prefix where remote tags will be temporarily fetched.
 const REMOTE_TAG_REF_NAMESPACE: &str = "refs/jj/remote-tags/";
 /// Ref name used as a placeholder to unset HEAD without a commit.
+///
+/// This is not a normal branch ref, and is deliberately left unborn: HEAD is
+/// pointed at it symbolically while the ref itself is kept nonexistent. That
+/// is how jj represents "HEAD has no commit yet".
 const UNBORN_ROOT_REF_NAME: &str = "refs/jj/root";
 /// Dummy file to be added to the index to indicate that the user is editing a
 /// commit with a conflict that isn't represented in the Git index.
@@ -1178,13 +1183,16 @@ fn remotely_pinned_commit_ids(view: &View) -> Vec<CommitId> {
 /// the child of the new HEAD revision.
 pub async fn import_head(
     mut_repo: &mut MutableRepo,
-    workspace: &WorkspaceName,
+    workspace_name: &WorkspaceName,
+    workspace_root: &Path,
 ) -> Result<(), GitImportError> {
     let store = mut_repo.store();
     let git_backend = get_git_backend(store)?;
-    let git_repo = git_backend.git_repo();
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(workspace_root)
+        .map_err(GitImportError::from_git)?;
 
-    let old_git_head = mut_repo.view().git_head(workspace);
+    let old_git_head = mut_repo.view().git_head(workspace_name);
     let new_git_head_id = if let Ok(oid) = git_repo.head_id() {
         Some(CommitId::from_bytes(oid.as_bytes()))
     } else {
@@ -1211,8 +1219,37 @@ pub async fn import_head(
         mut_repo.add_head(&commit).await?;
     }
 
-    mut_repo.set_git_head_target(workspace, RefTarget::resolved(new_git_head_id));
+    mut_repo.set_git_head_target(workspace_name, RefTarget::resolved(new_git_head_id));
     Ok(())
+}
+
+/// Imports the HEAD commit without updating the view.
+pub async fn import_head_commit(
+    mut_repo: &mut MutableRepo,
+) -> Result<Option<Commit>, GitImportError> {
+    let store = mut_repo.store();
+    let git_backend = get_git_backend(store)?;
+    let git_repo = git_backend.git_repo();
+
+    let Ok(oid) = git_repo.head_id() else {
+        return Ok(None);
+    };
+    let head_id = CommitId::from_bytes(oid.as_bytes());
+
+    let index = mut_repo.index();
+    if !index.has_id(&head_id).await? {
+        git_backend.import_head_commits([&head_id]).map_err(|err| {
+            GitImportError::MissingHeadTarget {
+                id: head_id.clone(),
+                err,
+            }
+        })?;
+    }
+    // It's unlikely the imported commits were missing, but I/O-related error
+    // can still occur.
+    let commit = store.get_commit_async(&head_id).await?;
+    mut_repo.add_head(&commit).await?;
+    Ok(Some(commit))
 }
 
 #[derive(Error, Debug)]
@@ -1792,6 +1829,109 @@ fn update_git_head(
 }
 
 #[derive(Debug, Error)]
+pub enum GitCreateWorktreeError {
+    #[error(transparent)]
+    Subprocess(#[from] GitSubprocessError),
+    #[error(transparent)]
+    Git(Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    UnexpectedBackend(#[from] UnexpectedGitBackendError),
+}
+
+impl GitCreateWorktreeError {
+    fn from_git(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Git(source.into())
+    }
+}
+
+/// Creates a Git worktree at `destination` to back a new jj workspace.
+///
+/// The worktree is created empty, with HEAD unborn. jj populates the working
+/// copy itself, and the subsequent HEAD export (see [`reset_head()`]) points
+/// HEAD at the parent of the new working-copy commit. Git is only responsible
+/// for the `.git` gitlink and the worktree bookkeeping under
+/// `.git/worktrees/`.
+pub fn create_worktree(
+    store: &Store,
+    subprocess_options: GitSubprocessOptions,
+    destination: &Path,
+) -> Result<(), GitCreateWorktreeError> {
+    let git_backend = get_git_backend(store)?;
+
+    // The unborn branch `git worktree add --orphan` insists on naming gets a
+    // random name: any name we could derive from the destination may already
+    // be taken by an exported bookmark.
+    let branch_name = format!("jj-worktree-{:016x}", rand::random::<u64>());
+    let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
+    git_ctx.spawn_worktree_add(destination, &branch_name)?;
+
+    // Nullifying HEAD puts the worktree in the same "HEAD has no commit yet"
+    // state jj uses everywhere else, so that a `git commit` in the new
+    // worktree can't materialize the branch nobody asked for. If the
+    // working-copy commit turns out to have a real parent, the HEAD export
+    // replaces this with a detached HEAD.
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(destination)
+        .map_err(GitCreateWorktreeError::from_git)?;
+    let unborn_branch = gix::refs::Target::Symbolic(
+        format!("refs/heads/{branch_name}")
+            .try_into()
+            .expect("valid ref name"),
+    );
+    update_git_head(
+        &git_repo,
+        gix::refs::transaction::PreviousValue::MustExistAndMatch(unborn_branch),
+        None,
+    )
+    .map_err(GitCreateWorktreeError::from_git)
+}
+
+#[derive(Debug, Error)]
+pub enum GitUnlinkWorktreeError {
+    #[error("Failed to remove .git gitlink file")]
+    RemoveGitLink(#[source] PathError),
+    #[error(transparent)]
+    Subprocess(#[from] GitSubprocessError),
+    #[error(transparent)]
+    UnexpectedBackend(#[from] UnexpectedGitBackendError),
+}
+
+/// Disconnects the Git worktree at `worktree_path` from the repository.
+///
+/// Returns `false` if there was no Git worktree to disconnect.
+///
+/// The worktree directory and its contents are left in place: only the `.git`
+/// gitlink and Git's bookkeeping under `.git/worktrees/` are removed. This is
+/// the inverse of [`create_worktree()`], which likewise only sets those up.
+///
+/// The gitlink is removed before the bookkeeping is pruned, so an error means
+/// either that nothing was done, or that the worktree is already disconnected
+/// and only stale metadata remains. Neither is worth failing a command over,
+/// so callers may treat all errors as non-fatal.
+pub fn unlink_worktree(
+    store: &Store,
+    subprocess_options: GitSubprocessOptions,
+    worktree_path: &Path,
+) -> Result<bool, GitUnlinkWorktreeError> {
+    let dot_git = worktree_path.join(".git");
+    if !dot_git.is_file() {
+        return Ok(false);
+    }
+    let git_backend = get_git_backend(store)?;
+    // `git worktree remove` isn't used because it deletes the directory
+    // contents, and forgetting a workspace should preserve its files.
+    std::fs::remove_file(&dot_git)
+        .context(&dot_git)
+        .map_err(GitUnlinkWorktreeError::RemoveGitLink)?;
+    // TODO: `git worktree prune` removes metadata for all worktrees whose
+    // working directories are missing, not just the one we removed. Ideally
+    // we'd target only the specific worktree.
+    let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
+    git_ctx.spawn_worktree_prune()?;
+    Ok(true)
+}
+
+#[derive(Debug, Error)]
 pub enum GitResetHeadError {
     #[error(transparent)]
     Backend(#[from] BackendError),
@@ -1813,10 +1953,14 @@ impl GitResetHeadError {
 /// the Git index.
 pub async fn reset_head(
     mut_repo: &mut MutableRepo,
-    workspace: &WorkspaceName,
+    workspace_name: &WorkspaceName,
+    workspace_root: &Path,
     wc_commit: &Commit,
 ) -> Result<(), GitResetHeadError> {
-    let git_repo = get_git_repo(mut_repo.store())?;
+    let git_backend = get_git_backend(mut_repo.store())?;
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(workspace_root)
+        .map_err(GitResetHeadError::from_git)?;
 
     let first_parent_id = &wc_commit.parent_ids()[0];
     let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
@@ -1826,7 +1970,7 @@ pub async fn reset_head(
     };
 
     // If the first parent of the working copy has changed, reset the Git HEAD.
-    let old_head_target = mut_repo.git_head(workspace);
+    let old_head_target = mut_repo.git_head(workspace_name);
     if *old_head_target != new_head_target {
         let expected_ref = if let Some(id) = old_head_target.as_normal() {
             // We have to check the actual HEAD state because we don't record a
@@ -1847,7 +1991,7 @@ pub async fn reset_head(
         let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
         update_git_head(&git_repo, expected_ref, new_oid)
             .map_err(|err| GitResetHeadError::UpdateHeadRef(err.into()))?;
-        mut_repo.set_git_head_target(workspace, new_head_target);
+        mut_repo.set_git_head_target(workspace_name, new_head_target);
     }
 
     // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
@@ -2068,10 +2212,14 @@ fn build_index_from_merged_tree(
 /// parent(s) has changed.
 pub async fn update_intent_to_add(
     repo: &dyn Repo,
+    workspace_root: &Path,
     old_tree: &MergedTree,
     new_tree: &MergedTree,
 ) -> Result<(), GitResetHeadError> {
-    let git_repo = get_git_repo(repo.store())?;
+    let git_backend = get_git_backend(repo.store())?;
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(workspace_root)
+        .map_err(GitResetHeadError::from_git)?;
     let mut index = git_repo
         .index_or_empty()
         .map_err(GitResetHeadError::from_git)?;
@@ -2154,6 +2302,17 @@ async fn update_intent_to_add_impl(
     }
 
     index.sort_entries();
+
+    // The entry mutations above (`dangerously_push_entry`, `remove_entries`,
+    // `sort_entries`) do not invalidate the cache-tree (TREE) extension loaded
+    // from disk, and `gix::index::File::write()` re-emits it as-is. Its own
+    // docs prescribe this discard: "Until the tree-cache is updated on write
+    // (see gitoxide#2421), remove it with `State::remove_tree()` before writing
+    // whenever entries were changed." Otherwise the written index carries a
+    // stale, under-counted cache-tree; an external `git add` that later
+    // rebuilds it trusts those child counts and emits a doubled subtree entry,
+    // which `git fsck` reports as duplicateEntries.
+    index.remove_tree();
 
     Ok(())
 }

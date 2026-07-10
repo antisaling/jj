@@ -19,6 +19,7 @@ use std::io;
 use std::io::Write as _;
 use std::iter;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::ArgGroup;
@@ -68,6 +69,7 @@ use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::cli_util::has_tracked_remote_bookmarks;
 use crate::cli_util::has_tracked_remote_tags;
+use crate::cli_util::print_updated_commits;
 use crate::cli_util::short_change_hash;
 use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
@@ -326,7 +328,6 @@ pub async fn cmd_git_push(
 
     let mut tx = workspace_command.start_transaction();
     let view = tx.repo().view();
-    let tx_description;
     let mut ref_updates = GitPushRefTargets::default();
     if args.all {
         let mut commits_validator =
@@ -355,10 +356,6 @@ pub async fn cmd_git_push(
                 Err(reason) => reason.print(ui)?,
             }
         }
-        tx_description = format!(
-            "{TX_DESC_PUSH}all bookmarks/tags to git remote {remote}",
-            remote = remote.as_symbol()
-        );
     } else if args.tracked {
         let mut commits_validator =
             CommitsValidator::new(ui, tx.base_workspace_helper(), remote, args)?;
@@ -392,10 +389,6 @@ pub async fn cmd_git_push(
                 Err(reason) => reason.print(ui)?,
             }
         }
-        tx_description = format!(
-            "{TX_DESC_PUSH}all tracked bookmarks/tags to git remote {remote}",
-            remote = remote.as_symbol()
-        );
     } else if args.deleted {
         // There shouldn't be new heads to push, but we run validation for consistency.
         let mut commits_validator =
@@ -432,10 +425,6 @@ pub async fn cmd_git_push(
                 Err(reason) => reason.print(ui)?,
             }
         }
-        tx_description = format!(
-            "{TX_DESC_PUSH}all deleted bookmarks/tags to git remote {remote}",
-            remote = remote.as_symbol()
-        );
     } else {
         let mut seen_bookmarks: HashSet<&RefName> = HashSet::new();
         let mut seen_tags: HashSet<&RefName> = HashSet::new();
@@ -579,12 +568,6 @@ pub async fn cmd_git_push(
                 Err(reason) => reason.print(ui)?,
             }
         }
-
-        tx_description = format!(
-            "{TX_DESC_PUSH}{names} to git remote {remote}",
-            names = make_updates_term(&ref_updates),
-            remote = remote.as_symbol()
-        );
     }
     if ref_updates.bookmarks.is_empty() && ref_updates.tags.is_empty() {
         writeln!(ui.status(), "Nothing changed.")?;
@@ -620,8 +603,9 @@ pub async fn cmd_git_push(
         let git_backend = git::get_git_backend(tx.repo().store()).map_err(user_error)?;
         let lfs_git_dir = git_backend.git_repo_path().to_owned();
         let lfs_worktree = git_backend
-            .git_workdir()
-            .map(ToOwned::to_owned)
+            .open_git_repo_at_workdir(&wc_root)
+            .ok()
+            .and_then(|git_repo| git_repo.workdir().map(PathBuf::from))
             .unwrap_or_else(|| wc_root.clone());
         let lfs_refs: Vec<String> = ref_updates
             .bookmarks
@@ -678,7 +662,29 @@ pub async fn cmd_git_push(
     // TODO: On partial success, locally-created --change/--named bookmarks will
     // be committed. It's probably better to remove failed local bookmarks.
     if push_stats.all_ok() || push_stats.some_exported() {
-        tx.finish(ui, tx_description).await?;
+        let description = if args.all {
+            format!(
+                "{TX_DESC_PUSH}all bookmarks/tags to git remote {remote}",
+                remote = remote.as_symbol()
+            )
+        } else if args.tracked {
+            format!(
+                "{TX_DESC_PUSH}all tracked bookmarks/tags to git remote {remote}",
+                remote = remote.as_symbol()
+            )
+        } else if args.deleted {
+            format!(
+                "{TX_DESC_PUSH}all deleted bookmarks/tags to git remote {remote}",
+                remote = remote.as_symbol()
+            )
+        } else {
+            format!(
+                "{TX_DESC_PUSH}{names} to git remote {remote}",
+                names = make_updates_term(&ref_updates),
+                remote = remote.as_symbol()
+            )
+        };
+        tx.finish(ui, description).await?;
     }
     if push_stats.all_ok() {
         Ok(())
@@ -885,12 +891,12 @@ fn ready_to_push_revset_expression(
         .flat_map(|(_, old_head)| old_head.target.added_ids())
         .cloned()
         .collect_vec();
-    RevsetExpression::commits(old_heads)
-        .union(workspace_helper.env().immutable_heads_expression())
-        .range(&RevsetExpression::commits(new_heads))
+    RevsetExpression::commits(old_heads).range(&RevsetExpression::commits(new_heads))
 }
 
 /// Signs commits before pushing.
+///
+/// Warns about commits that need a signature but are immutable.
 ///
 /// Returns the updated list of bookmark names and corresponding
 /// [`BookmarkPushUpdate`]s.
@@ -902,14 +908,42 @@ async fn sign_commits_before_push(
 ) -> Result<GitPushRefTargets, CommandError> {
     let mut sign_settings = tx.settings().sign_settings();
     sign_settings.behavior = SignBehavior::Own;
-    let commit_ids: IndexSet<CommitId> = tx
-        .base_workspace_helper()
-        .attach_revset_evaluator(commits_to_push)
+    // TODO: make filter condition configurable by revset?
+    let needs_signing = |commit: &Commit| {
+        future::ready(!commit.is_signed() && sign_settings.should_sign(commit.store_commit()))
+    };
+
+    let workspace_helper = tx.base_workspace_helper();
+    let immutable = workspace_helper.env().immutable_expression();
+    let skipped: Vec<Commit> = workspace_helper
+        .attach_revset_evaluator(commits_to_push.intersection(&immutable))
         .evaluate_to_commits()?
-        // TODO: make filter condition configurable by revset?
-        .try_filter(|commit| {
-            future::ready(!commit.is_signed() && sign_settings.should_sign(commit.store_commit()))
-        })
+        .try_filter(needs_signing)
+        .take(11)
+        .try_collect()
+        .await?;
+    if !skipped.is_empty() {
+        let count = if skipped.len() > 10 {
+            "10+".to_owned()
+        } else {
+            skipped.len().to_string()
+        };
+        writeln!(
+            ui.warning_default(),
+            "Skipped signing {count} immutable commits:"
+        )?;
+        let mut formatter = ui.stderr_formatter();
+        print_updated_commits(
+            formatter.as_mut(),
+            &workspace_helper.commit_summary_template(),
+            &skipped,
+        )?;
+    }
+
+    let commit_ids: IndexSet<CommitId> = workspace_helper
+        .attach_revset_evaluator(commits_to_push.minus(&immutable))
+        .evaluate_to_commits()?
+        .try_filter(needs_signing)
         .map_ok(|commit| commit.id().clone())
         .try_collect()
         .await?;

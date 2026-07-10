@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(missing_docs)]
+//! Contains the [`Matcher`] trait which is used for matching against
+//! [`RepoPath`]s and guiding walks of directory trees.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fmt::Debug;
 
 use globset::Glob;
+use globset::GlobBuilder;
 use itertools::Itertools as _;
 use tracing::instrument;
 
@@ -25,13 +28,17 @@ use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathComponentBuf;
 use crate::repo_path::RepoPathTree;
 
+/// Describes which tree entries need to be visited.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Visit {
     /// Everything in the directory is *guaranteed* to match, no need to check
     /// descendants
     AllRecursively,
+    /// Visit only the specified directories or files.
     Specific {
+        /// Visit these specific directories.
         dirs: VisitDirs,
+        /// Visit these specific files.
         files: VisitFiles,
     },
     /// Nothing in the directory or its subdirectories will match.
@@ -50,7 +57,8 @@ impl Visit {
         files: VisitFiles::All,
     };
 
-    fn sets(dirs: HashSet<RepoPathComponentBuf>, files: HashSet<RepoPathComponentBuf>) -> Self {
+    /// Visit these sets of `dirs` and `files`.
+    pub fn sets(dirs: HashSet<RepoPathComponentBuf>, files: HashSet<RepoPathComponentBuf>) -> Self {
         if dirs.is_empty() && files.is_empty() {
             Self::Nothing
         } else {
@@ -61,25 +69,36 @@ impl Visit {
         }
     }
 
+    /// Returns true if nothing is matched.
     pub fn is_nothing(&self) -> bool {
         *self == Self::Nothing
     }
 }
 
+/// Describes which subdirectories to visit.
 #[derive(PartialEq, Eq, Debug)]
 pub enum VisitDirs {
+    /// Visit all possible directories.
     All,
+    /// Visit the specified set of directories.
     Set(HashSet<RepoPathComponentBuf>),
 }
 
+/// Describes which files to visit.
 #[derive(PartialEq, Eq, Debug)]
 pub enum VisitFiles {
+    /// Visit all possible files.
     All,
+    /// Visit the specified set of files.
     Set(HashSet<RepoPathComponentBuf>),
 }
 
+/// A [`Matcher`] matches against `RepoPath`s and helps guide a traversal of a
+/// directory files.
 pub trait Matcher: Debug + Send + Sync {
+    /// Returns true if the `file` matches the path.
     fn matches(&self, file: &RepoPath) -> bool;
+    /// Returns a `Visit` which specifies how further traversal should commence.
     fn visit(&self, dir: &RepoPath) -> Visit;
 }
 
@@ -103,6 +122,7 @@ impl<T: Matcher + ?Sized> Matcher for Box<T> {
     }
 }
 
+/// Matches no paths.
 #[derive(PartialEq, Eq, Debug)]
 pub struct NothingMatcher;
 
@@ -116,6 +136,7 @@ impl Matcher for NothingMatcher {
     }
 }
 
+/// Matches all paths.
 #[derive(PartialEq, Eq, Debug)]
 pub struct EverythingMatcher;
 
@@ -129,12 +150,14 @@ impl Matcher for EverythingMatcher {
     }
 }
 
+/// Matches the specified files.
 #[derive(PartialEq, Eq, Debug)]
 pub struct FilesMatcher {
     tree: RepoPathTree<FilesNodeKind>,
 }
 
 impl FilesMatcher {
+    /// Create a new `FilesMatcher` for the given `files`.
     pub fn new(files: impl IntoIterator<Item = impl AsRef<RepoPath>>) -> Self {
         let mut tree = RepoPathTree::default();
         for f in files {
@@ -182,12 +205,14 @@ fn files_tree_to_visit_sets(tree: &RepoPathTree<FilesNodeKind>) -> Visit {
     Visit::sets(dirs, files)
 }
 
+/// Matches paths on the given prefixes.
 #[derive(Debug)]
 pub struct PrefixMatcher {
     tree: RepoPathTree<PrefixNodeKind>,
 }
 
 impl PrefixMatcher {
+    /// Create a new `PrefixMatcher` for the given `prefixes`.
     #[instrument(skip(prefixes))]
     pub fn new(prefixes: impl IntoIterator<Item = impl AsRef<RepoPath>>) -> Self {
         let mut tree = RepoPathTree::default();
@@ -300,7 +325,7 @@ impl Matcher for GlobsMatcher {
 /// Constructs [`GlobsMatcher`] from patterns.
 #[derive(Clone, Debug)]
 pub struct GlobsMatcherBuilder<'a> {
-    dir_patterns: Vec<(&'a RepoPath, &'a Glob)>,
+    dir_patterns: Vec<(&'a RepoPath, &'a PathGlobPattern)>,
     matches_prefix_paths: bool,
 }
 
@@ -320,7 +345,7 @@ impl<'a> GlobsMatcherBuilder<'a> {
     ///
     /// The `dir` should be the longest directory path that contains no glob
     /// meta characters.
-    pub fn add(&mut self, dir: &'a RepoPath, pattern: &'a Glob) {
+    pub fn add(&mut self, dir: &'a RepoPath, pattern: &'a PathGlobPattern) {
         self.dir_patterns.push((dir, pattern));
     }
 
@@ -337,10 +362,10 @@ impl<'a> GlobsMatcherBuilder<'a> {
             // Based on new_regex() in globset. We don't use GlobSet because
             // RepoPath separator should be "/" on all platforms.
             let mut regex_builder = if matches_prefix_paths {
-                let regex_patterns = chunk.map(|(_, pattern)| glob_to_prefix_regex(pattern));
+                let regex_patterns = chunk.map(|(_, pattern)| pattern.to_prefix_regex());
                 regex::bytes::RegexSetBuilder::new(regex_patterns)
             } else {
-                regex::bytes::RegexSetBuilder::new(chunk.map(|(_, pattern)| pattern.regex()))
+                regex::bytes::RegexSetBuilder::new(chunk.map(|(_, pattern)| pattern.as_regex()))
             };
             let regex = regex_builder
                 .dot_matches_new_line(true)
@@ -358,15 +383,60 @@ impl<'a> GlobsMatcherBuilder<'a> {
     }
 }
 
-fn glob_to_prefix_regex(glob: &Glob) -> String {
-    // Here we rely on the implementation detail of the globset crate.
-    // Alternatively, we can construct an anchored regex automaton and test
-    // prefix matching by feeding characters one by one.
-    let prefix = glob
-        .regex()
-        .strip_suffix('$')
-        .expect("glob regex should be anchored");
-    format!("{prefix}(?:/|$)")
+/// Wrapper for a [`Glob`] parsed with `literal_separator = true`.
+#[derive(Clone)]
+pub struct PathGlobPattern(Glob);
+
+impl Debug for PathGlobPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PathGlobPattern")
+            .field("glob", &self.0.glob())
+            .field("re", &self.0.regex())
+            // Omit opts and tokens
+            .finish_non_exhaustive()
+    }
+}
+
+impl PathGlobPattern {
+    /// Parses case-sensitive glob pattern.
+    pub fn parse(input: &str) -> Result<Self, globset::Error> {
+        Self::parse_inner(input, false)
+    }
+
+    /// Parses case-insensitive glob pattern.
+    pub fn parse_i(input: &str) -> Result<Self, globset::Error> {
+        Self::parse_inner(input, true)
+    }
+
+    fn parse_inner(input: &str, icase: bool) -> Result<Self, globset::Error> {
+        let glob = GlobBuilder::new(input)
+            .literal_separator(true)
+            .case_insensitive(icase)
+            .build()?;
+        Ok(Self(glob))
+    }
+
+    /// Returns the original glob pattern.
+    pub fn as_str(&self) -> &str {
+        self.0.glob()
+    }
+
+    /// Returns the regular expression string for this glob.
+    pub fn as_regex(&self) -> &str {
+        self.0.regex()
+    }
+
+    fn to_prefix_regex(&self) -> String {
+        // Here we rely on the implementation detail of the globset crate.
+        // Alternatively, we can construct an anchored regex automaton and test
+        // prefix matching by feeding characters one by one.
+        let prefix = self
+            .0
+            .regex()
+            .strip_suffix('$')
+            .expect("glob regex should be anchored");
+        format!("{prefix}(?:/|$)")
+    }
 }
 
 /// Matches paths that are matched by any of the input matchers.
@@ -377,6 +447,7 @@ pub struct UnionMatcher<M1, M2> {
 }
 
 impl<M1: Matcher, M2: Matcher> UnionMatcher<M1, M2> {
+    /// Create a `UnionMatcher` matching when either of the inputs match.
     pub fn new(input1: M1, input2: M2) -> Self {
         Self { input1, input2 }
     }
@@ -434,6 +505,8 @@ pub struct DifferenceMatcher<M1, M2> {
 }
 
 impl<M1: Matcher, M2: Matcher> DifferenceMatcher<M1, M2> {
+    /// Create a new `DifferenceMatcher` matching when `wanted` matches and
+    /// `unwanted` does not.
     pub fn new(wanted: M1, unwanted: M2) -> Self {
         Self { wanted, unwanted }
     }
@@ -464,6 +537,7 @@ pub struct IntersectionMatcher<M1, M2> {
 }
 
 impl<M1: Matcher, M2: Matcher> IntersectionMatcher<M1, M2> {
+    /// Create a `IntersectionMatcher` matching when both inputs match.
     pub fn new(input1: M1, input2: M2) -> Self {
         Self { input1, input2 }
     }
@@ -526,7 +600,6 @@ mod tests {
     use maplit::hashset;
 
     use super::*;
-    use crate::fileset::parse_file_glob;
 
     fn repo_path(value: &str) -> &RepoPath {
         RepoPath::from_internal_string(value).unwrap()
@@ -536,12 +609,11 @@ mod tests {
         RepoPathComponentBuf::new(value).unwrap()
     }
 
-    fn glob(s: &str) -> Glob {
-        let icase = false;
-        parse_file_glob(s, icase).unwrap()
+    fn glob(s: &str) -> PathGlobPattern {
+        PathGlobPattern::parse(s).unwrap()
     }
 
-    fn new_file_globs_matcher(dir_patterns: &[(&RepoPath, Glob)]) -> GlobsMatcher {
+    fn new_file_globs_matcher(dir_patterns: &[(&RepoPath, PathGlobPattern)]) -> GlobsMatcher {
         let mut builder = GlobsMatcher::builder();
         for (dir, pattern) in dir_patterns {
             builder.add(dir, pattern);
@@ -549,7 +621,7 @@ mod tests {
         builder.build()
     }
 
-    fn new_prefix_globs_matcher(dir_patterns: &[(&RepoPath, Glob)]) -> GlobsMatcher {
+    fn new_prefix_globs_matcher(dir_patterns: &[(&RepoPath, PathGlobPattern)]) -> GlobsMatcher {
         let mut builder = GlobsMatcher::builder().prefix_paths(true);
         for (dir, pattern) in dir_patterns {
             builder.add(dir, pattern);

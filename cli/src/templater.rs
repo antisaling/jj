@@ -524,14 +524,14 @@ pub trait TemplatePropertyExt: TemplateProperty {
         TemplateFunction::new(self, move |value| Ok(function(value)))
     }
 
-    /// Translates to a property that will unwrap an extracted `Option` value
-    /// of the specified `type_name`, mapping `None` to `Err`.
+    /// Translates to a property that will unwrap an extracted `Some` value of
+    /// the specified option `type_name`, mapping `None` to `Err`.
     fn try_unwrap<O>(self, type_name: &str) -> impl TemplateProperty<Output = O>
     where
         Self: TemplateProperty<Output = Option<O>> + Sized,
     {
         self.and_then(move |opt| {
-            opt.ok_or_else(|| TemplatePropertyError(format!("No {type_name} available").into()))
+            opt.ok_or_else(|| TemplatePropertyError(format!("No value set to {type_name}").into()))
         })
     }
 
@@ -600,6 +600,18 @@ pub trait AnyTemplateProperty<'a> {
     ) -> Option<Box<dyn Template + 'a>>;
 }
 pub type BoxedAnyProperty<'a> = Box<dyn AnyTemplateProperty<'a> + 'a>;
+
+pub fn list_to_boolean<'a, T: 'a>(
+    property: BoxedTemplateProperty<'a, Vec<T>>,
+) -> BoxedTemplateProperty<'a, bool> {
+    property.map(|list| !list.is_empty()).into_dyn()
+}
+
+pub fn option_to_boolean<'a, T: 'a>(
+    property: BoxedTemplateProperty<'a, Option<T>>,
+) -> BoxedTemplateProperty<'a, bool> {
+    property.map(|opt| opt.is_some()).into_dyn()
+}
 
 /// Adapter that wraps literal value in `TemplateProperty`.
 pub struct Literal<O>(pub O);

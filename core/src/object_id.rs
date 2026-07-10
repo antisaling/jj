@@ -12,46 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(missing_docs)]
+//! Identifiers for objects (commits, changes, trees, etc.), and utilities for
+//! parsing and matching identifier prefixes.
 
 use std::fmt;
 use std::fmt::Debug;
 
 use crate::hex_util;
 
+/// An identifier for an object, such as a commit or a tree, usually the output
+/// of a hash function.
 pub trait ObjectId {
+    /// A lowercase name identifying the type of object (e.g. "commit").
     fn object_type(&self) -> String;
+    /// The identifier as a byte slice.
     fn as_bytes(&self) -> &[u8];
+    /// The identifier as an owned byte vector.
     fn to_bytes(&self) -> Vec<u8>;
+    /// String representation of the identifier using hex digits.
     fn hex(&self) -> String;
 }
 
-// Defines a new struct type with visibility `vis` and name `ident` containing
-// a single Vec<u8> used to store an identifier (typically the output of a hash
-// function) as bytes. Types defined using this macro automatically implement
-// the `ObjectId` and `ContentHash` traits.
-// Documentation comments written inside the macro definition will be captured
-// and associated with the type defined by the macro.
-//
-// Example:
-// ```no_run
-// id_type!(
-//     /// My favorite id type.
-//     pub MyId { hex() }
-// );
-// ```
-macro_rules! id_type {
+/// Defines a new struct type representing an object ID, with visibility `vis`
+/// and name `ident`.
+///
+/// The struct contains a single `Vec<u8>` used to store the identifier
+/// (typically the output of a hash function) as bytes. Types defined using this
+/// macro automatically implement the `ObjectId` and `ContentHash` traits.
+/// Documentation comments written inside the macro definition will be captured
+/// and associated with the type defined by the macro.
+///
+/// Example:
+/// ```
+/// # use jj_core::object_id::*;
+/// id_type!(
+///     /// My favorite id type.
+///     pub MyId { hex() }
+/// );
+/// ```
+#[doc(hidden)] // hide jj_core::_id_type!()
+#[macro_export]
+macro_rules! _id_type {
     (   $(#[$attr:meta])*
         $vis:vis $name:ident { $hex_method:ident() }
     ) => {
         $(#[$attr])*
         #[derive($crate::content_hash::ContentHash, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
         $vis struct $name(Vec<u8>);
-        $crate::object_id::impl_id_type!($name, $hex_method);
+        $crate::object_id::_impl_id_type!($name, $hex_method);
     };
 }
 
-macro_rules! impl_id_type {
+#[doc(hidden)]
+#[macro_export]
+macro_rules! _impl_id_type {
     ($name:ident, $hex_method:ident) => {
         #[allow(dead_code)]
         impl $name {
@@ -105,7 +119,7 @@ macro_rules! impl_id_type {
             }
         }
 
-        impl crate::object_id::ObjectId for $name {
+        impl $crate::object_id::ObjectId for $name {
             fn object_type(&self) -> String {
                 stringify!($name)
                     .strip_suffix("Id")
@@ -129,8 +143,9 @@ macro_rules! impl_id_type {
     };
 }
 
-pub(crate) use id_type;
-pub(crate) use impl_id_type;
+#[doc(inline)]
+pub use _id_type as id_type;
+pub use _impl_id_type;
 
 /// An identifier prefix (typically from a type implementing the [`ObjectId`]
 /// trait) with facilities for converting between bytes and a hex string.
@@ -163,6 +178,8 @@ impl HexPrefix {
         })
     }
 
+    /// Returns a new `HexPrefix` representing the given full bytes (i.e. an
+    /// even number of hex digits.)
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             min_prefix_bytes: bytes.to_owned(),
@@ -239,12 +256,16 @@ impl Debug for HexPrefix {
 /// The result of a prefix search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixResolution<T> {
+    /// The prefix matched no objects.
     NoMatch,
+    /// The prefix matched exactly one object.
     SingleMatch(T),
+    /// The prefix matched more than one object.
     AmbiguousMatch,
 }
 
 impl<T> PrefixResolution<T> {
+    /// Transforms the matched object, if any, by applying `f` to it.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> PrefixResolution<U> {
         match self {
             Self::NoMatch => PrefixResolution::NoMatch,
@@ -253,6 +274,8 @@ impl<T> PrefixResolution<T> {
         }
     }
 
+    /// Transforms the matched object, if any, by applying `f` to it, turning
+    /// a single match into [`NoMatch`](Self::NoMatch) if `f` returns `None`.
     pub fn filter_map<U>(self, f: impl FnOnce(T) -> Option<U>) -> PrefixResolution<U> {
         match self {
             Self::NoMatch => PrefixResolution::NoMatch,
@@ -266,6 +289,8 @@ impl<T> PrefixResolution<T> {
 }
 
 impl<T: Clone> PrefixResolution<T> {
+    /// Combines two resolutions, e.g. from different sources, turning two
+    /// single matches into an ambiguous match.
     pub fn plus(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::NoMatch, other) => other.clone(),
@@ -280,19 +305,8 @@ impl<T: Clone> PrefixResolution<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ChangeId;
-    use crate::backend::CommitId;
 
-    #[test]
-    fn test_display_object_id() {
-        let commit_id = CommitId::from_hex("deadbeef0123");
-        assert_eq!(format!("{commit_id}"), "deadbeef0123");
-        assert_eq!(format!("{commit_id:.6}"), "deadbe");
-
-        let change_id = ChangeId::from_hex("deadbeef0123");
-        assert_eq!(format!("{change_id}"), "mlpmollkzyxw");
-        assert_eq!(format!("{change_id:.6}"), "mlpmol");
-    }
+    id_type!(SomeId { hex() });
 
     #[test]
     fn test_hex_prefix_prefixes() {
@@ -317,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_hex_prefix_matches() {
-        let id = CommitId::from_hex("1234");
+        let id = SomeId::from_hex("1234");
 
         assert!(HexPrefix::try_from_hex("").unwrap().matches(&id));
         assert!(HexPrefix::try_from_hex("1").unwrap().matches(&id));

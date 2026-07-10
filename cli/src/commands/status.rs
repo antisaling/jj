@@ -26,6 +26,7 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::revset::RevsetFilterPredicate;
+use jj_lib::tree::TreeMergeExt as _;
 use jj_lib::working_copy::SnapshotStats;
 use jj_lib::working_copy::UntrackedReason;
 use tracing::instrument;
@@ -88,12 +89,8 @@ pub(crate) async fn cmd_status(
 
     if let Some(wc_commit) = &maybe_wc_commit {
         let status = collect_working_copy_status(repo.as_ref(), wc_commit, snapshot_stats).await?;
-        print_unmatched_explicit_paths(
-            ui,
-            &workspace_command,
-            &fileset_expression,
-            [&status.tree],
-        )?;
+        print_unmatched_explicit_paths(ui, &workspace_command, &fileset_expression, [&status.tree])
+            .await?;
 
         if !status.has_any_tracked_changes() && !status.has_any_untracked_paths() {
             writeln!(formatter, "The working copy has no changes.")?;

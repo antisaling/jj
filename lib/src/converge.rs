@@ -16,6 +16,7 @@
 //! <https://github.com/jj-vcs/jj/blob/main/docs/design/jj-converge-command.md>
 //! for more details.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -29,36 +30,37 @@ use futures::TryStreamExt as _;
 use futures::executor::block_on_stream;
 use futures::future::try_join_all;
 use itertools::Itertools as _;
-use jj_lib::backend::BackendError;
-use jj_lib::backend::BackendResult;
-use jj_lib::backend::ChangeId;
-use jj_lib::backend::CommitId;
-use jj_lib::backend::Signature;
-use jj_lib::backend::TreeId;
-use jj_lib::commit::Commit;
-use jj_lib::conflict_labels::ConflictLabels;
-use jj_lib::evolution::WalkPredecessorsError;
-use jj_lib::evolution::walk_predecessors;
-use jj_lib::graph_dominators::FlowGraph;
-use jj_lib::graph_dominators::SimpleDirectedGraph;
-use jj_lib::graph_dominators::ValueCache;
-use jj_lib::index::IndexError;
-use jj_lib::merge::Merge;
-use jj_lib::merge::MergeBuilder;
-use jj_lib::merge::SameChange;
-use jj_lib::merged_tree::MergedTree;
-use jj_lib::repo::MutableRepo;
-use jj_lib::repo::ReadonlyRepo;
-use jj_lib::repo::Repo as _;
-use jj_lib::revset::ResolvedRevsetExpression;
-use jj_lib::revset::RevsetEvaluationError;
-use jj_lib::revset::RevsetExpression;
-use jj_lib::rewrite::merge_commit_trees_no_resolve;
-use jj_lib::store::Store;
 use thiserror::Error;
 
+use crate::backend::BackendError;
+use crate::backend::BackendResult;
+use crate::backend::ChangeId;
+use crate::backend::CommitId;
+use crate::backend::Signature;
+use crate::backend::TreeId;
+use crate::commit::Commit;
+use crate::conflict_labels::ConflictLabels;
+use crate::evolution::WalkPredecessorsError;
+use crate::evolution::walk_predecessors;
+use crate::graph_dominators::FlowGraph;
+use crate::graph_dominators::SimpleDirectedGraph;
+use crate::graph_dominators::ValueCache;
+use crate::index::IndexError;
+use crate::merge::Merge;
+use crate::merge::MergeBuilder;
+use crate::merge::SameChange;
+use crate::merged_tree::MergedTree;
+use crate::repo::MutableRepo;
+use crate::repo::ReadonlyRepo;
+use crate::repo::Repo as _;
+use crate::revset::ResolvedRevsetExpression;
+use crate::revset::RevsetEvaluationError;
+use crate::revset::RevsetExpression;
+use crate::rewrite::merge_commit_trees_no_resolve;
+use crate::store::Store;
+
 /// Maps change-ids to commits with that change-id.
-pub type CommitsByChangeId = HashMap<ChangeId, HashMap<CommitId, Commit>>;
+pub type CommitsByChangeId = BTreeMap<ChangeId, Vec<Commit>>;
 
 /// The result of attempting to converge a particular attribute (description,
 /// author, parents, tree) of a set of divergent commits.
@@ -124,7 +126,7 @@ pub enum ConvergeError {
 pub async fn find_divergent_changes(
     repo: &Arc<ReadonlyRepo>,
     revset_expression: Arc<ResolvedRevsetExpression>,
-) -> Result<CommitsByChangeId, RevsetEvaluationError> {
+) -> Result<CommitsByChangeId, ConvergeError> {
     let mut result = CommitsByChangeId::new();
     let mut stream = revset_expression.evaluate(repo.as_ref())?.stream();
     while let Some(commit_id) = stream.try_next().await? {
@@ -132,7 +134,7 @@ pub async fn find_divergent_changes(
         result
             .entry(commit.change_id().clone())
             .or_default()
-            .insert(commit.id().clone(), commit);
+            .push(commit);
     }
     // Remove entries that have only a single commit — we only care about
     // changes with multiple divergent commits.
@@ -648,8 +650,8 @@ where
     // provide change-offsets for hidden commits, we consider those as having
     // maximum change-offset and use input-order as the secondary sorting criterion.
     // By input-order we refer to the order of commits passed to converge_change.
-    // But some commits are not given as input, so we use CommitId as tertiary
-    // sorting criterion.
+    // But some commits are not given as input, so we use commit timestamp and
+    // CommitId as additional sorting criteria.
 
     let resolved_change_targets = truncated_evolution_graph
         .repo()
@@ -661,19 +663,36 @@ where
         .enumerate()
         .map(|(position, commit_id)| (commit_id, position))
         .collect();
-    let producer = producers
-        .iter()
-        .min_by_key(|commit_id: &&CommitId| {
+
+    // The sorting key is (change_offset, input_position, negated millis since Unix
+    // epoch, commit_id).
+    type SortingKey = (usize, usize, i64, CommitId);
+    let producers: Vec<_> = try_join_all(producers.iter().map(
+        async |commit_id| -> Result<SortingKey, ConvergeError> {
             let change_offset = match &resolved_change_targets {
                 Some(change_targets) => change_targets.find_offset(commit_id).unwrap_or(usize::MAX),
                 None => usize::MAX,
             };
             let input_position = *input_position.get(commit_id).unwrap_or(&usize::MAX);
-            (change_offset, input_position, *commit_id)
-        })
-        .unwrap()
-        .clone();
-    Ok(producer)
+            let commit = truncated_evolution_graph
+                .repo()
+                .store()
+                .get_commit_async(commit_id)
+                .await?;
+            // We take MillisSinceEpoch and negate it, so that more recent commits are
+            // before older ones.
+            let millis_since_unix_epoch = commit.committer().timestamp.timestamp.0;
+            Ok((
+                change_offset,
+                input_position,
+                -millis_since_unix_epoch,
+                commit_id.clone(),
+            ))
+        },
+    ))
+    .await?;
+    let (_, _, _, commit_id) = producers.iter().min().unwrap().clone();
+    Ok(commit_id)
 }
 
 async fn rebase_tree_onto_solution_parents(

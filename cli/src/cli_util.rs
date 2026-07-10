@@ -48,8 +48,10 @@ use clap::error::ContextKind;
 use clap::error::ContextValue;
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
+use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::future::try_join_all;
+use futures::stream;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use indoc::indoc;
@@ -109,8 +111,6 @@ use jj_lib::repo::StoreLoadError;
 use jj_lib::repo::merge_factories_map;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::repo_path::RepoPathUiConverter;
-use jj_lib::repo_path::UiPathParseError;
 use jj_lib::revset;
 use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetAliasesMap;
@@ -133,6 +133,8 @@ use jj_lib::str_util::StringExpression;
 use jj_lib::str_util::StringMatcher;
 use jj_lib::transaction::Transaction;
 use jj_lib::transaction::TransactionCommitError;
+use jj_lib::ui_path::RepoPathUiConverter;
+use jj_lib::ui_path::UiPathParseError;
 use jj_lib::working_copy;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
@@ -668,7 +670,7 @@ impl CommandHelper {
                 match WorkingCopyFreshness::check_stale(
                     locked_ws.locked_wc(),
                     &desired_wc_commit,
-                    repo,
+                    &repo,
                     true,
                 )
                 .await?
@@ -688,12 +690,14 @@ impl CommandHelper {
                             && self.should_commit_transaction()
                         {
                             let workspace_name = workspace_command.env.workspace_name();
+                            let workspace_root = workspace_command.env.workspace_root();
                             let mut tx =
                                 start_repo_transaction(repo, workspace_name, self.string_args());
                             try_reset_git_head(
                                 ui,
                                 tx.repo_mut(),
                                 workspace_name,
+                                workspace_root,
                                 &desired_wc_commit,
                                 git_import_export_lock,
                             )
@@ -969,7 +973,7 @@ impl WorkspaceCommandEnvironment {
             base: workspace.workspace_root().to_owned(),
         };
         #[cfg(feature = "git")]
-        let working_copy_shared_with_git = crate::git_util::is_colocated_git_workspace(workspace);
+        let working_copy_shared_with_git = crate::git_util::is_colocated_git_workspace(workspace)?;
         #[cfg(not(feature = "git"))]
         let working_copy_shared_with_git = false;
         let mut env = Self {
@@ -997,6 +1001,11 @@ impl WorkspaceCommandEnvironment {
     pub(crate) fn cwd(&self) -> &Path {
         let RepoPathUiConverter::Fs { cwd, base: _ } = &self.path_converter;
         cwd
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        let RepoPathUiConverter::Fs { cwd: _, base } = &self.path_converter;
+        base
     }
 
     pub fn workspace_name(&self) -> &WorkspaceName {
@@ -1381,8 +1390,9 @@ impl WorkspaceCommandHelper {
     ) -> Result<(), CommandError> {
         assert!(self.may_snapshot_working_copy);
         let workspace_name = self.workspace_name().to_owned();
+        let workspace_root = self.workspace_root().to_owned();
         let mut tx = self.start_transaction();
-        jj_lib::git::import_head(tx.repo_mut(), &workspace_name).await?;
+        jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root).await?;
         if !tx.repo().has_changes() {
             return Ok(());
         }
@@ -1813,18 +1823,19 @@ to the current parents may contain changes from multiple commits.
         op_walk::resolve_op_with_repo(self.repo(), op_str).block_on()
     }
 
-    /// Resolve a revset to a single revision. Return an error if the revset is
-    /// empty or has multiple revisions.
+    /// Resolves a revset to a single revision. Returns an error if the revset
+    /// is empty or has multiple revisions.
     pub async fn resolve_single_rev(
         &self,
         ui: &Ui,
         revision_arg: &RevisionArg,
     ) -> Result<Commit, CommandError> {
         let expression = self.parse_revset(ui, revision_arg)?;
-        revset_util::evaluate_revset_to_single_commit(revision_arg.as_ref(), &expression, || {
-            self.commit_summary_template()
-        })
-        .await
+        revset_util::evaluate_revset_to_single_commit(&expression)
+            .await
+            .map_err(|err| {
+                err.to_command_error(revision_arg.as_ref(), &self.commit_summary_template())
+            })
     }
 
     /// Evaluates revset expressions to set of commit IDs. The
@@ -2174,12 +2185,14 @@ to the current parents may contain changes from multiple commits.
             #[cfg(feature = "git")]
             if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction()
             {
+                let workspace_root = self.env.workspace_root();
                 if wc_immutable {
                     // New working-copy commit is created on top. Reset Git HEAD and index.
                     try_reset_git_head(
                         ui,
                         mut_repo,
                         &workspace_name,
+                        workspace_root,
                         &new_wc_commit,
                         git_import_export_lock,
                     )
@@ -2194,9 +2207,15 @@ to the current parents may contain changes from multiple commits.
                 } else {
                     let old_tree = wc_commit.tree();
                     let new_tree = new_wc_commit.tree();
-                    export_working_copy_changes_to_git(ui, mut_repo, &old_tree, &new_tree)
-                        .await
-                        .map_err(snapshot_command_error)?;
+                    export_working_copy_changes_to_git(
+                        ui,
+                        mut_repo,
+                        workspace_root,
+                        &old_tree,
+                        &new_tree,
+                    )
+                    .await
+                    .map_err(snapshot_command_error)?;
                 }
             }
 
@@ -2378,6 +2397,7 @@ to the current parents may contain changes from multiple commits.
                     ui,
                     tx.repo_mut(),
                     self.workspace_name(),
+                    self.workspace_root(),
                     wc_commit,
                     git_import_export_lock,
                 )
@@ -2683,11 +2703,12 @@ to the current parents may contain changes from multiple commits.
 pub async fn export_working_copy_changes_to_git(
     ui: &Ui,
     mut_repo: &mut MutableRepo,
+    workspace_root: &Path,
     old_tree: &MergedTree,
     new_tree: &MergedTree,
 ) -> Result<(), CommandError> {
     let repo = mut_repo.base_repo().as_ref();
-    jj_lib::git::update_intent_to_add(repo, old_tree, new_tree).await?;
+    jj_lib::git::update_intent_to_add(repo, workspace_root, old_tree, new_tree).await?;
     let stats = jj_lib::git::export_refs(mut_repo)?;
     crate::git_util::print_git_export_stats(ui, &stats)?;
     Ok(())
@@ -2696,6 +2717,7 @@ pub async fn export_working_copy_changes_to_git(
 pub async fn export_working_copy_changes_to_git(
     _ui: &Ui,
     _mut_repo: &mut MutableRepo,
+    _workspace_root: &Path,
     _old_tree: &MergedTree,
     _new_tree: &MergedTree,
 ) -> Result<(), CommandError> {
@@ -2707,6 +2729,7 @@ async fn try_reset_git_head(
     ui: &Ui,
     mut_repo: &mut MutableRepo,
     workspace_name: &WorkspaceName,
+    workspace_root: &Path,
     wc_commit: &Commit,
     _git_import_export_lock: &GitImportExportLock,
 ) -> Result<(), CommandError> {
@@ -2717,7 +2740,7 @@ async fn try_reset_git_head(
     // This can still fail if HEAD was updated concurrently by another JJ process
     // (overlapping transaction) or a non-JJ process (e.g., git checkout). In that
     // case, the actual state will be imported on the next snapshot.
-    match jj_lib::git::reset_head(mut_repo, workspace_name, wc_commit).await {
+    match jj_lib::git::reset_head(mut_repo, workspace_name, workspace_root, wc_commit).await {
         Ok(()) => Ok(()),
         Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
             writeln!(ui.warning_default(), "{err}")?;
@@ -3365,16 +3388,23 @@ Discard the conflicting changes with `jj restore --from {}`.",
 
 /// Prints warning about explicit paths that don't match any of the tree
 /// entries.
-pub fn print_unmatched_explicit_paths<'a>(
+pub async fn print_unmatched_explicit_paths<'a>(
     ui: &Ui,
     workspace_command: &WorkspaceCommandHelper,
     expression: &FilesetExpression,
     trees: impl IntoIterator<Item = &'a MergedTree>,
-) -> io::Result<()> {
+) -> Result<(), CommandError> {
     let mut explicit_paths = expression.explicit_paths().collect_vec();
     for tree in trees {
-        // TODO: propagate errors
-        explicit_paths.retain(|&path| tree.path_value(path).block_on().unwrap().is_absent());
+        explicit_paths = stream::iter(explicit_paths)
+            .filter_map(|path| async move {
+                tree.path_value(path)
+                    .await
+                    .map(|value| value.is_absent().then_some(path))
+                    .transpose()
+            })
+            .try_collect()
+            .await?;
     }
 
     if !explicit_paths.is_empty() {

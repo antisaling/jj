@@ -100,13 +100,13 @@ impl From<RunError> for CommandError {
     }
 }
 
-fn default_tree_state_settings(ignore_filters: &HashSet<String>) -> TreeStateSettings {
+fn default_tree_state_settings(ignore_filters: HashSet<String>) -> TreeStateSettings {
     TreeStateSettings {
         conflict_marker_style: ConflictMarkerStyle::Snapshot,
         eol_conversion_mode: EolConversionMode::None,
         exec_change_setting: ExecChangeSetting::Auto,
         fsmonitor_settings: FsmonitorSettings::None,
-        ignore_filters: ignore_filters.clone(),
+        ignore_filters,
     }
 }
 
@@ -165,10 +165,10 @@ struct WorkspacePool {
     /// rewritten commit. Loaded once from `snapshot.auto-track`; essentially
     /// the user's `.gitignore` story for what counts as a build artifact.
     auto_tracking_matcher: Box<dyn Matcher>,
+    ignore_filters: HashSet<String>,
     /// When true, wipe each slot's working copy on acquisition so every commit
     /// starts from a freshly checked-out tree (no artifact reuse).
     clean: bool,
-    ignore_filters: HashSet<String>,
 }
 
 impl WorkspacePool {
@@ -176,8 +176,8 @@ impl WorkspacePool {
         repo_path: &Path,
         size: NonZeroUsize,
         auto_tracking_matcher: Box<dyn Matcher>,
-        clean: bool,
         ignore_filters: HashSet<String>,
+        clean: bool,
     ) -> Result<Self, RunError> {
         // The parent() call is needed to not write under `.jj/repo/`.
         let base_path = repo_path.parent().unwrap().join("run").join("default");
@@ -186,8 +186,8 @@ impl WorkspacePool {
             base_path,
             size,
             auto_tracking_matcher,
-            clean,
             ignore_filters,
+            clean,
         })
     }
 
@@ -214,7 +214,7 @@ impl WorkspacePool {
         let tree_state_path = state_dir.join("tree_state");
 
         let is_reused_workspace = tree_state_path.exists();
-        let settings = default_tree_state_settings(&self.ignore_filters);
+        let settings = default_tree_state_settings(self.ignore_filters.clone());
         let mut tree_state = if !self.clean && is_reused_workspace {
             // Load the persisted tree state so `check_out` below can diff
             // against it, only touching files that changed and removing files
@@ -364,8 +364,6 @@ struct RunJob {
     /// run (i.e. the commit was skipped). May be a conflicted tree when the
     /// command left conflicts in the working copy.
     new_tree: Option<MergedTree>,
-    /// Was the tree even modified.
-    dirty: bool,
     /// Bytes the subprocess wrote to its stdout, captured in full.
     stdout: Vec<u8>,
     /// Bytes the subprocess wrote to its stderr, captured in full.
@@ -468,7 +466,6 @@ async fn rewrite_commit(
                 old_id,
                 old_tree,
                 new_tree: None,
-                dirty: false,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 skipped: true,
@@ -564,7 +561,6 @@ async fn rewrite_commit(
         old_id,
         old_tree,
         new_tree,
-        dirty,
         stdout: output.stdout,
         stderr: output.stderr,
         skipped: false,
@@ -765,6 +761,7 @@ pub async fn cmd_run(
         #[cfg(feature = "git")]
         {
             use jj_lib::git::GitSettings;
+
             GitSettings::from_settings(workspace_command.settings())?
                 .ignore_filters
                 .into_iter()
@@ -783,15 +780,14 @@ pub async fn cmd_run(
         builder.enable_time();
         builder.build().unwrap()
     };
-    let mut done_commits = HashSet::new();
     let (sender_tx, mut receiver) = mpsc::channel(jobs.get());
 
     let pool = Arc::new(WorkspacePool::new(
         &repo_path,
         jobs,
         auto_tracking_matcher,
-        args.clean,
         ignore_filters,
+        args.clean,
     )?);
 
     let spec = Arc::new(CommandSpec {
@@ -824,7 +820,7 @@ pub async fn cmd_run(
             while let Some(res) = receiver.recv().await {
                 if res.skipped {
                     writeln!(
-                        ui.stderr(),
+                        ui.status(),
                         "Skipped commit {}: directory does not exist: {}",
                         res.old_id.hex(),
                         spec.subdir.as_deref().unwrap_or(Path::new("")).display()
@@ -854,10 +850,9 @@ pub async fn cmd_run(
                             return Err(error);
                         }
                     }
-                    if res.dirty
-                        && let Some(new_tree) = res.new_tree
+                    if let Some(new_tree) = res.new_tree
+                        && new_tree.tree_ids_and_labels() != res.old_tree.tree_ids_and_labels()
                     {
-                        done_commits.insert(res.old_id.clone());
                         rewritten_commits.insert(res.old_id.clone(), (res.old_tree, new_tree));
                     }
                 }
@@ -875,7 +870,7 @@ pub async fn cmd_run(
     // The command did something, so rewrite the commits.
     let restore_descendants = args.restore_descendants;
     let mut count: u32 = 0;
-    let mut num_reparented: u32 = 0;
+    let mut num_rebased: u32 = 0;
     tx.repo_mut()
         .transform_descendants(
             resolved_commits.iter().ids().cloned().collect_vec(),
@@ -904,26 +899,32 @@ pub async fn cmd_run(
                         .await?;
                         builder.set_tree(merged).write().await?;
                     }
-                    (None, true) => {
-                        // Descendant outside the run set — keep its content.
-                        rewriter.reparent().write().await?;
-                        num_reparented += 1;
-                    }
-                    (None, false) => {
-                        // Default: propagate the diff into descendants.
-                        rewriter.rebase().await?.write().await?;
+                    (None, restore_descendants) => {
+                        // Descendant outside the run set
+                        if rewriter.parents_changed() {
+                            if restore_descendants {
+                                rewriter.reparent().write().await?;
+                            } else {
+                                rewriter.rebase().await?.write().await?;
+                            }
+                            num_rebased += 1;
+                        }
                     }
                 }
                 Ok(())
             },
         )
         .await?;
-    writeln!(ui.stderr(), "Rewrote {count} commits.")?;
-    if restore_descendants && num_reparented > 0 {
-        writeln!(
-            ui.stderr(),
-            "Rebased {num_reparented} descendant commits (while preserving their content)."
-        )?;
+    writeln!(ui.status(), "Rewrote {count} commits.")?;
+    if num_rebased > 0 {
+        if restore_descendants {
+            writeln!(
+                ui.status(),
+                "Rebased {num_rebased} descendant commits (while preserving their content)."
+            )?;
+        } else {
+            writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
+        }
     }
     tx.finish(ui, format!("run: rewrite {count} commits"))
         .await?;

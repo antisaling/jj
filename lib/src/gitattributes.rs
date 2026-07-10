@@ -57,6 +57,7 @@ use gix_attributes::glob::pattern::Case;
 use gix_attributes::search::MetadataCollection;
 use gix_attributes::search::Outcome;
 
+use crate::backend::MergedTreeValueExt as _;
 use crate::backend::TreeValue;
 use crate::merge::SameChange;
 use crate::merged_tree::MergedTree;

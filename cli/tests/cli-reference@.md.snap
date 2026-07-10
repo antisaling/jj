@@ -37,6 +37,7 @@ This document contains the help content for the `jj` command-line program.
 * [`jj config path`↴](#jj-config-path)
 * [`jj config set`↴](#jj-config-set)
 * [`jj config unset`↴](#jj-config-unset)
+* [`jj converge`↴](#jj-converge)
 * [`jj describe`↴](#jj-describe)
 * [`jj diff`↴](#jj-diff)
 * [`jj diffedit`↴](#jj-diffedit)
@@ -155,6 +156,7 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `bookmark` — Manage bookmarks [default alias: b]
 * `commit` — Update the description and create a new change on top [default alias: ci]
 * `config` — Manage config options
+* `converge` — Converge divergent changes
 * `describe` — Update the change description or other metadata [default alias: desc]
 * `diff` — Compare file contents between two revisions
 * `diffedit` — Touch up the content changes in a revision with a diff editor
@@ -772,7 +774,7 @@ Start an editor on a jj config file.
 
 Creates the file if it doesn't already exist regardless of what the editor does.
 
-**Usage:** `jj config edit <--user|--repo|--workspace>`
+**Usage:** `jj config edit <--user|--repo|--workspace|--file <PATH>>`
 
 **Command Alias:** `e`
 
@@ -781,6 +783,13 @@ Creates the file if it doesn't already exist regardless of what the editor does.
 * `--user` — Target the user-level config
 * `--repo` — Target the repo-level config
 * `--workspace` — Target the workspace-level config
+* `--file <PATH>` — Target the config file specified by the given path
+
+   The path must point to a valid configuration file location recognized by Jujutsu (such as a user/repo/workspace config, a file inside a `conf.d/` directory, or any file loaded via system configs, `$JJ_CONFIG`, or `--config-file`).
+
+   Unlike the global `--config-file` option (which loads an extra config file when running commands), this option specifies which file to inspect, edit, or modify on disk.
+
+   If the file does not exist, commands like `set` and `edit` will create it and any missing parent directories.
 
 
 
@@ -882,7 +891,7 @@ See `jj config edit` if you'd like to immediately edit a file.
 
 Update a config file to set the given option to a given value
 
-**Usage:** `jj config set <--user|--repo|--workspace> <NAME> <VALUE>`
+**Usage:** `jj config set <--user|--repo|--workspace|--file <PATH>> <NAME> <VALUE>`
 
 **Command Alias:** `s`
 
@@ -900,6 +909,13 @@ Update a config file to set the given option to a given value
 * `--user` — Target the user-level config
 * `--repo` — Target the repo-level config
 * `--workspace` — Target the workspace-level config
+* `--file <PATH>` — Target the config file specified by the given path
+
+   The path must point to a valid configuration file location recognized by Jujutsu (such as a user/repo/workspace config, a file inside a `conf.d/` directory, or any file loaded via system configs, `$JJ_CONFIG`, or `--config-file`).
+
+   Unlike the global `--config-file` option (which loads an extra config file when running commands), this option specifies which file to inspect, edit, or modify on disk.
+
+   If the file does not exist, commands like `set` and `edit` will create it and any missing parent directories.
 
 
 
@@ -907,7 +923,7 @@ Update a config file to set the given option to a given value
 
 Update a config file to unset the given option
 
-**Usage:** `jj config unset <--user|--repo|--workspace> <NAME>`
+**Usage:** `jj config unset <--user|--repo|--workspace|--file <PATH>> <NAME>`
 
 **Command Alias:** `u`
 
@@ -920,6 +936,42 @@ Update a config file to unset the given option
 * `--user` — Target the user-level config
 * `--repo` — Target the repo-level config
 * `--workspace` — Target the workspace-level config
+* `--file <PATH>` — Target the config file specified by the given path
+
+   The path must point to a valid configuration file location recognized by Jujutsu (such as a user/repo/workspace config, a file inside a `conf.d/` directory, or any file loaded via system configs, `$JJ_CONFIG`, or `--config-file`).
+
+   Unlike the global `--config-file` option (which loads an extra config file when running commands), this option specifies which file to inspect, edit, or modify on disk.
+
+   If the file does not exist, commands like `set` and `edit` will create it and any missing parent directories.
+
+
+
+## `jj converge`
+
+Converge divergent changes
+
+Attempts to resolve divergence by replacing two or more visible revisions for a given change with a single revision. `jj converge` evaluates the revset(s) given by the `--revisions` arg (or the `revsets.converge` setting if none are specified) and groups the resulting revisions by change ID. Change IDs with more than one revision are divergent.
+
+If there is no divergence it returns successfully. If there is more than one divergent change it prompts the user to choose one. The command then applies heuristics to try to automatically come up with a good solution (i.e. a new revision) that replaces the divergent revisions. If the heuristics are inconclusive `jj converge` falls back to prompting the user. Use `--no-interactive` to print a warning instead of prompting the user.
+
+The user may be prompted for any of the following: to merge revision descriptions, to choose parents for the solution, and/or (very rarely) to choose a revision author.
+
+When a solution is found, the new revision replaces the divergent revisions of the specific change ID (but only those matching the revsets; if there are other visible revisions for the same change ID outside the revset, those will remain and you will still have divergence, though it will be reduced). Descendants of the divergent revisions are rebased onto the solution, and local bookmarks pointing to any divergent revision are updated to point to the solution.
+
+Note that there may be file conflicts in the solution whether or not there were conflicts to begin with.
+
+The modifications made by `jj converge` can be reviewed by `jj op show -p`. You can inspect the change evolution with `jj evolog`. If not satisfied with the result you can run `jj undo`.
+
+**Usage:** `jj converge [OPTIONS]`
+
+###### **Options:**
+
+* `-r`, `--revision <REVSETS>` — The search space to look for divergent revisions
+
+   If no revisions are specified, this defaults to the `revsets.converge` setting.
+* `--no-interactive` — Do not prompt the user for help resolving divergence
+
+   If the command cannot solve divergence automatically it will print a warning and exit without making any changes (divergence will still be present).
 
 
 
@@ -927,7 +979,9 @@ Update a config file to unset the given option
 
 Update the change description or other metadata [default alias: desc]
 
-Starts an editor to let you edit the description of changes. The editor will be $EDITOR, or `nano` if that's not defined (`Notepad` on Windows).
+Starts an editor to let you edit the description of changes. Set `ui.editor` to customize your editor. See `jj help -k config` or the [editor docs] for more information on how the editor is chosen.
+
+[editor docs]: https://docs.jj-vcs.dev/latest/config/#editor
 
 **Usage:** `jj describe [OPTIONS] [REVSETS]...`
 
@@ -1103,7 +1157,7 @@ Lists the previous commits which a change has pointed to. The current commit of 
 
    Applied after revisions are reordered topologically, but before being reversed.
 * `--reversed` — Show revisions in the opposite order (older revisions first)
-* `-G`, `--no-graph` — Don't show the graph, show a flat list of revisions
+* `-G`, `--no-graph` — Show a flat list of revisions instead of a graph
 * `-T`, `--template <TEMPLATE>` — Render each revision using the given template
 
    All 0-argument methods of the [`CommitEvolutionEntry` type] are available as keywords in the template expression. See [`jj help -k templates`] for more information.
@@ -1363,11 +1417,11 @@ output.
 See `jj help -k config` chapter `Code formatting and other file content
 transformations` to understand how to configure your tools.
 
-### Execution Example
+### Execution example
 
-Let's consider the following configuration is set. We have two code
-formatters (`clang-format` and `black`), which apply to three different
-file extensions (`.cc`, `.h`, and `.py`):
+Let's consider the following configuration. We have two code formatters
+(`clang-format` and `black`), which apply to three different file extensions
+(`.cc`, `.h`, and `.py`):
 
 ```toml
 [fix.tools.clang-format]
@@ -1396,23 +1450,23 @@ A (mutable)
 X (immutable)
 ```
 
-By default, `jj fix` will modify revisions that matches the revset
-`reachable(@, mutable())` (see `jj help -k revsets`) which corresponds to
+By default, `jj fix` will modify revisions that match the revset
+`reachable(@, mutable())` (see `jj help -k revsets`), which corresponds to
 the revisions `A`, `B` and `C` here.
 
 The following operations will then happen:
 
-- For revision `A`, content from this revision for files `src/bar.cc` and
-  `src/bar.h` will each be provided to `clang-format` and the result output
-  will be used to recreate revision `A` which we will call `A'`. All other
-  files are untouched.
-- For revision `B`, same thing happen for files `src/bar.cc` and `src/bar.h`
-  Their content from revision `B` will go through `clang-format`. The file
-  `README.md` as any other files, are untouched as no pattern matches it. We
-  obtain revision `B'`.
-- For revision `C`, `src/bar.cc` and `src/bar.h` goes through `clang-format`
-  and file `foo.py` is fixed using `black`. Any other file is untouched. We
-  obtain revision `C'`.
+- For revision `A`, the contents from this revision for files `src/bar.cc`
+  and `src/bar.h` will be provided to `clang-format`, and the resulting
+  output will be used to recreate revision `A`, which we will call `A'`. All
+  other files are untouched.
+- For revision `B`, the same thing happens for files `src/bar.cc` and
+  `src/bar.h`. Their contents from revision `B` will go through
+  `clang-format`. The file `README.md`, same as all other files, is
+  untouched as no pattern matches it. We obtain revision `B'`.
+- For revision `C`, the files `src/bar.cc` and `src/bar.h` go through
+  `clang-format` and the file `foo.py` is fixed using `black`. All other
+  files are untouched. We obtain revision `C'`.
 
 ```text
 C (mutable)                    /-> C'
@@ -1467,57 +1521,93 @@ Interact with Gerrit Code Review
 
 ## `jj gerrit upload`
 
-Upload changes to Gerrit for code review, or update existing changes.
+Upload changes to Gerrit for code review, or update existing changes
 
-Uploading in a set of revisions to Gerrit creates a single "change" for each revision included in the revset. These changes are then available for review on your Gerrit instance.
+Uploading a set of revisions to Gerrit creates a single "change" for each
+revision included in the revset and all their mutable ancestors. These
+changes will then be available for review on your Gerrit instance.
 
-Note: The Gerrit commit Id may not match that of your local commit Id, since we add a `Change-Id` footer to the commit message if one does not already exist. This ID is based off the jj Change-Id, but is not the same.
+If a change already exists for a given revision (i.e. it contains the
+same `Change-Id`), this command will update the contents of the existing
+change to match.
 
-If a change already exists for a given revision (i.e. it contains the same `Change-Id`), this command will update the contents of the existing change to match.
+Note: Any commit in the given revset that does not have a `Change-Id`
+trailer will have one generated based on the Jujutsu change ID. This trailer
+is only added to the uploaded commit, which means the resulting commit ID
+uploaded to Gerrit may not match your local commit ID. As a result, you may
+encounter divergence when you fetch a merged change into your local repo. To
+address this, you can abandon your local change or rebase it on top of trunk
+with `jj rebase --skip-emptied ...`, which will resolve the divergence.
+Alternatively, you can add the following to your Jujutsu config to add
+`Change-Id` trailers to your local commits automatically before `jj gerrit
+upload` does:
+```toml
+[templates]
+commit_trailers = '''
+if(
+  !trailers.contains_key("Change-Id"),
+  format_gerrit_change_id_trailer(self)
+)
+'''
+```
 
-Note: this command takes 1-or-more revsets arguments, each of which can resolve to multiple revisions; so you may post trees or ranges of commits to Gerrit for review all at once.
+Also see the [Jujutsu docs on Gerrit].
+
+[Jujutsu docs on Gerrit]: https://docs.jj-vcs.dev/latest/gerrit
 
 **Usage:** `jj gerrit upload [OPTIONS]`
 
 ###### **Options:**
 
-* `-r`, `--revision <REVSETS>` — The revset, selecting which revisions are sent in to Gerrit
+* `-r`, `--revision <REVSETS>` — The revisions to upload to Gerrit
 
-   This can be any arbitrary set of commits. Note that when you push a commit at the head of a stack, all ancestors are pushed too. This means that `jj gerrit upload -r foo` is equivalent to `jj gerrit upload -r 'mutable()::foo`.
+   All mutable ancestors of specified revisions will also be pushed. This means that `jj gerrit upload -r foo` is equivalent to `jj gerrit upload -r 'mutable()::foo'`.
 
-   If this is not provided, it will check whether @ has a description. * If it does, it will upload @ * Otherwise, it will upload @-
+   If this is not provided, `@` will be uploaded if it has a description, and `@-` will be uploaded otherwise.
 * `-b`, `--remote-branch <REMOTE_BRANCH>` — The location where your changes are intended to land
 
-   This should be a branch on the remote. Can be configured with the `gerrit.default-remote-branch` repository option.
+   This should be a branch on the remote. The default is the `gerrit.default-remote-branch` setting.
 * `--remote <REMOTE>` — The Gerrit remote to push to
 
-   Can be configured with the `gerrit.default-remote` repository option as well. This is typically a full SSH URL for your Gerrit instance.
-* `-n`, `--dry-run` — Do not actually push the changes to Gerrit
+   This can point to any configured Git remote, or can be a full SSH URL. The default is the `gerrit.default-remote` setting.
+* `-n`, `--dry-run` — Only display what will change on the remote; do not push changes to Gerrit
 * `--reviewer <REVIEWER>` — Add these emails as a reviewer (can be repeated)
 * `--cc <CC>` — CC these emails on the change (can be repeated)
 * `-l`, `--label <LABEL>` — Add the following labels configured by Gerrit (can be repeated)
 
-   Gerrit silently ignores labels not present on your gerrit host. Defaults to +1 if no value is set. Eg. --label=Commit-Queue will set the Commit-Queue label to +1. Eg. --label=Commit-Queue+2 will set it to +2.
-* `--topic <TOPIC>` — Applies a topic to the change
+   Each label can have a suffix of the value to set, such as "+2". The
+   default is "+1" if no value is set.
 
-   See https://gerrit-review.googlesource.com/Documentation/intro-user.html#topics. Changes can be grouped by topic, and Gerrit can be configured to submit all changes in a topic together in a single click.
-* `--hashtag <HASHTAG>` — Applies a hashtag to the change (can be repeated)
+   Note that Gerrit silently ignores labels not present on your Gerrit
+   host.
 
-   See https://gerrit-review.googlesource.com/Documentation/intro-user.html#hashtags. Hashtags are freeform strings associated with a change, like on social media platforms. Similar to topics, hashtags can be used to group related changes together, and to search using the hashtag: operator. Unlike topics, a change can have multiple hashtags, and they are only used for informational grouping. Changes with the same hashtags are not necessarily submitted together.
-* `-m`, `--message <MESSAGE>` — A patch set description for the new patch set
+   Examples:
+   - `--label=Commit-Queue` will set the `Commit-Queue` label to +1.
+   - `--label=Commit-Queue+2` will set it to +2.
+* `--topic <TOPIC>` — Apply a topic to the change
+
+   Changes can be grouped by topic, and Gerrit can be configured to submit all changes in a topic together in a single click.
+
+   See https://gerrit-review.googlesource.com/Documentation/intro-user.html#topics.
+* `--hashtag <HASHTAG>` — Apply a hashtag to the change (can be repeated)
+
+   Hashtags are freeform strings associated with a change, like on social media platforms. Similar to topics, hashtags can be used to group related changes together, and to search using the `hashtag:` operator. Unlike topics, a change can have multiple hashtags, and they are only used for informational grouping. Changes with the same hashtags are not necessarily submitted together.
+
+   See https://gerrit-review.googlesource.com/Documentation/intro-user.html#hashtags.
+* `-m`, `--message <MESSAGE>` — The description for the patch set
 * `--edit` — Push the change as a change edit
 
-   To push a change edit the underlying change need to already exist on the gerrit server. Change edits don't immediately create a new patchset, but need to be published from the web UI first. There can only be one edit for each change. Pushing a new change edit will replace the previous one.
-* `--wip` — Marks the change as WIP (work in progress)
+   To push a change edit the underlying change needs to already exist on the Gerrit server. Change edits don't immediately create a new patch set, but need to be published from the web UI first. There can only be one edit for each change. Pushing a new change edit will replace the previous one.
+* `--wip` — Mark the change as WIP (work in progress)
 
    See https://gerrit-review.googlesource.com/Documentation/intro-user.html#wip.
-* `--ready` — Unmarks the change as WIP (work in progress)
-* `--private` — Marks the change as private
+* `--ready` — Mark the change as ready (no longer work in progress)
+* `--private` — Mark the change as private
 
    See https://gerrit-review.googlesource.com/Documentation/intro-user.html#private-changes.
-* `--remove-private` — Unmarks the change as private
-* `--publish-comments` — Publishes any draft comments for the given change
-* `--no-publish-comments` — Disables publishing of any draft comments for the given change
+* `--remove-private` — Unmark the change as private
+* `--publish-comments` — Publish draft comments for the given change
+* `--no-publish-comments` — Do not publish draft comments for the given change
 
    This is only useful if the user has configured Gerrit to publish comments by default.
 * `--notify <NOTIFY>` — Who to email notifications to (defaults to all)
@@ -2075,7 +2165,7 @@ The working-copy commit is indicated by a `@` symbol in the graph. [Immutable re
 
    Applied after revisions are filtered and reordered topologically, but before being reversed.
 * `--reversed` — Show revisions in the opposite order (older revisions first)
-* `-G`, `--no-graph` — Don't show the graph, show a flat list of revisions
+* `-G`, `--no-graph` — Show a flat list of revisions instead of a graph
 * `-T`, `--template <TEMPLATE>` — Render each revision using the given template
 
    Run `jj log -T` to list the built-in templates.
@@ -2347,7 +2437,7 @@ Compare changes to the repository between two operations
 * `--operation <OPERATION>` [alias: `op`] — Show repository changes in this operation, compared to its parent
 * `-f`, `--from <FROM>` — Show repository changes from this operation
 * `-t`, `--to <TO>` — Show repository changes to this operation
-* `-G`, `--no-graph` — Don't show the graph, show a flat list of modified changes
+* `-G`, `--no-graph` — Show a flat list of modified changes instead of a graph
 * `-p`, `--patch` — Show patch of modifications to changes
 
    If the previous version has different parents, it will be temporarily rebased to the parents of the new version, so the diff is not contaminated by unrelated changes.
@@ -2403,7 +2493,7 @@ Like other commands, `jj op log` snapshots the current working-copy changes and 
 
    Applied after operations are reordered topologically, but before being reversed.
 * `--reversed` — Show operations in the opposite order (older operations first)
-* `-G`, `--no-graph` — Don't show the graph, show a flat list of operations
+* `-G`, `--no-graph` — Show a flat list of operations instead of a graph
 * `-T`, `--template <TEMPLATE>` — Render each operation using the given template
 
    You can specify arbitrary template expressions using the [built-in keywords]. See [`jj help -k templates`] for more information.
@@ -2515,7 +2605,7 @@ Show changes to the repository in an operation
 
 ###### **Options:**
 
-* `-G`, `--no-graph` — Don't show the graph, show a flat list of modified changes
+* `-G`, `--no-graph` — Show a flat list of modified changes instead of a graph
 * `-T`, `--template <TEMPLATE>` — Render the operation using the given template
 
    You can specify arbitrary template expressions using the [built-in keywords]. See [`jj help -k templates`] for more information.
@@ -3738,9 +3828,64 @@ Print the CLI help for all subcommands in Markdown
 
 Snapshot the working copy if needed
 
-Snapshots the working copy and updates the working-copy commit if the working copy has changed since the last snapshot. Since almost every command snapshots the working copy, there is very little reason to run this command as a human; it is mostly meant for scripts.
+Snapshots the working copy and updates the working-copy commit if the
+working copy has changed since the last snapshot. Since almost every command
+snapshots the working copy, there is very little reason to run this command
+as a human; it is mostly meant for scripts.
 
-If you want to see the ID of the current operation after this command, run `jj operation log --limit 1`. However, since that command also snapshots the working copy, there would be no need to run `jj util snapshot` first.
+If you want to see the ID of the current operation after this command, run
+`jj operation log --limit 1`. However, since that command also snapshots the
+working copy, there would be no need to run `jj util snapshot` first.
+
+### Example of programmatic snapshotting
+
+Consider the following:
+
+```bash
+$ echo content > new-file.txt
+# At this point, `jj` does not know about `new-file.txt`.
+$ ./my-script-that-runs-jj-commands
+# Since the script ran `jj` commands, the changes to `new-file.txt` have
+# been snapshotted in an operation, which you can see with:
+$ jj operation log --patch
+```
+
+If `my-script-that-runs-jj-commands` has a "sandwich" of `jj util snapshot`
+at the beginning and end of the script, then the operation that captures
+`new-file.txt` will be distinct from the operations created by the `jj`
+commands in that script. In addition, the `jj operation log --patch` that
+you ran on the command-line after the script would also have its own
+operation if needed. However, without `jj util snapshot`, these operations
+will be mixed together in the operation log. If this is important to you,
+then `jj util snapshot` is useful here to explicitly trigger a snapshot.
+
+### Checking if the operation ID changed
+
+If you want to compare "before and after" operation IDs, it may be better to
+use `jj operation log --no-graph --limit 1 -T id` to query for operation
+information, which you can store in a variable in a script. You can then
+compare these values as needed to figure out if anything changed during a
+`jj` command, such as:
+
+```bash
+start_op_id="$(jj op log -G -n 1 -T id)"
+jj git fetch || exit
+fetch_op_id="$(jj op log -G -n 1 -T id)"
+if [[ "${start_op_id}" == "${fetch_op_id}" ]]; then
+  # Nothing was fetched.
+  exit 0
+fi
+jj rebase -r 'mutable()' -o 'trunk()'
+rebase_op_id="$(jj op log -G -n 1 -T id)"
+if [[ "${fetch_op_id}" == "${rebase_op_id}" ]]; then
+  # Nothing was rebased.
+  exit 0
+fi
+echo "Fetched and rebased!"
+```
+
+Note that `jj util snapshot` does not output an operation ID, so it is not
+suitable for checks such as these.
 
 **Usage:** `jj util snapshot`
 
@@ -3800,6 +3945,12 @@ By default, the new workspace inherits the sparse patterns of the current worksp
 
    If any revisions are specified, the new workspace will be created, and the new working-copy commit will be created with all these revisions as parents, i.e. the working-copy commit will exist as if you had run `jj new r1 r2 r3 ...`.
 * `-m`, `--message <MESSAGE>` — The change description to use
+* `--colocate` — Create a corresponding Git worktree for this workspace
+
+   By default, a Git worktree is created when the current workspace is colocated and the [git.colocate config] is `true`.
+
+   [git.colocate config]: https://docs.jj-vcs.dev/latest/config/#default-colocation
+* `--no-colocate` — Do not create a Git worktree for this workspace
 * `--sparse-patterns <SPARSE_PATTERNS>` — How to handle sparse patterns when creating a new workspace
 
   Default value: `copy`

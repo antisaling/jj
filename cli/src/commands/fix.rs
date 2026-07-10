@@ -37,10 +37,10 @@ use jj_lib::fix::compute_file_line_count;
 use jj_lib::fix::fix_files;
 use jj_lib::matchers::Matcher;
 use jj_lib::repo::Repo as _;
-use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::revset::RevsetStreamExt as _;
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
+use jj_lib::ui_path::RepoPathUiConverter;
 use pollster::FutureExt as _;
 use tracing::instrument;
 
@@ -84,11 +84,11 @@ use crate::ui::Ui;
 /// See `jj help -k config` chapter `Code formatting and other file content
 /// transformations` to understand how to configure your tools.
 ///
-/// ### Execution Example
+/// ### Execution example
 ///
-/// Let's consider the following configuration is set. We have two code
-/// formatters (`clang-format` and `black`), which apply to three different
-/// file extensions (`.cc`, `.h`, and `.py`):
+/// Let's consider the following configuration. We have two code formatters
+/// (`clang-format` and `black`), which apply to three different file extensions
+/// (`.cc`, `.h`, and `.py`):
 ///
 /// ```toml
 /// [fix.tools.clang-format]
@@ -117,23 +117,23 @@ use crate::ui::Ui;
 /// X (immutable)
 /// ```
 ///
-/// By default, `jj fix` will modify revisions that matches the revset
-/// `reachable(@, mutable())` (see `jj help -k revsets`) which corresponds to
+/// By default, `jj fix` will modify revisions that match the revset
+/// `reachable(@, mutable())` (see `jj help -k revsets`), which corresponds to
 /// the revisions `A`, `B` and `C` here.
 ///
 /// The following operations will then happen:
 ///
-/// - For revision `A`, content from this revision for files `src/bar.cc` and
-///   `src/bar.h` will each be provided to `clang-format` and the result output
-///   will be used to recreate revision `A` which we will call `A'`. All other
-///   files are untouched.
-/// - For revision `B`, same thing happen for files `src/bar.cc` and `src/bar.h`
-///   Their content from revision `B` will go through `clang-format`. The file
-///   `README.md` as any other files, are untouched as no pattern matches it. We
-///   obtain revision `B'`.
-/// - For revision `C`, `src/bar.cc` and `src/bar.h` goes through `clang-format`
-///   and file `foo.py` is fixed using `black`. Any other file is untouched. We
-///   obtain revision `C'`.
+/// - For revision `A`, the contents from this revision for files `src/bar.cc`
+///   and `src/bar.h` will be provided to `clang-format`, and the resulting
+///   output will be used to recreate revision `A`, which we will call `A'`. All
+///   other files are untouched.
+/// - For revision `B`, the same thing happens for files `src/bar.cc` and
+///   `src/bar.h`. Their contents from revision `B` will go through
+///   `clang-format`. The file `README.md`, same as all other files, is
+///   untouched as no pattern matches it. We obtain revision `B'`.
+/// - For revision `C`, the files `src/bar.cc` and `src/bar.h` go through
+///   `clang-format` and the file `foo.py` is fixed using `black`. All other
+///   files are untouched. We obtain revision `C'`.
 ///
 /// ```text
 /// C (mutable)                    /-> C'
@@ -243,7 +243,8 @@ pub(crate) async fn cmd_fix(
         .block_on()
     });
 
-    print_unmatched_explicit_paths(ui, tx.base_workspace_helper(), &fileset_expression, &trees)?;
+    print_unmatched_explicit_paths(ui, tx.base_workspace_helper(), &fileset_expression, &trees)
+        .await?;
 
     let summary = fix_files(
         commit_ids,

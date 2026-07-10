@@ -23,6 +23,7 @@ See [contribution docs](contributing.md#code-reviews) for details on this policy
 
 * 06393993
 * 2079884FDavid
+* aabmass
 * ajaspers
 * algmyr
 * AM5800
@@ -49,6 +50,7 @@ See [contribution docs](contributing.md#code-reviews) for details on this policy
 * michaelchirico
 * mlcui-corp
 * orthros
+* pmandloi28
 * prattmic
 * qfel
 * Ralith
@@ -58,6 +60,7 @@ See [contribution docs](contributing.md#code-reviews) for details on this policy
 * spectral54
 * steadmon
 * tbodt
+* vaghinak-vardanyan
 * zygoloid
 
 ## IMC Trading

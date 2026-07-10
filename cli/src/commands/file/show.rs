@@ -18,6 +18,7 @@ use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendResult;
+use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::conflicts::ConflictMaterializeOptions;
 use jj_lib::conflicts::MaterializedTreeValue;
 use jj_lib::conflicts::materialize_merge_result;
@@ -130,7 +131,7 @@ pub(crate) async fn cmd_file_show(
             .map_ok(|(path, value)| TreeEntry { path, value }),
     )
     .await?;
-    print_unmatched_explicit_paths(ui, &workspace_command, &fileset_expression, [&tree])?;
+    print_unmatched_explicit_paths(ui, &workspace_command, &fileset_expression, [&tree]).await?;
     Ok(())
 }
 

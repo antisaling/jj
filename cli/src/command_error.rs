@@ -28,6 +28,7 @@ use jj_lib::config::ConfigFileSaveError;
 use jj_lib::config::ConfigGetError;
 use jj_lib::config::ConfigLoadError;
 use jj_lib::config::ConfigMigrateError;
+use jj_lib::converge::ConvergeError;
 use jj_lib::dsl_util::Diagnostics;
 use jj_lib::evolution::WalkPredecessorsError;
 use jj_lib::fileset::FilePatternParseError;
@@ -46,7 +47,6 @@ use jj_lib::repo::EditCommitError;
 use jj_lib::repo::RepoLoaderError;
 use jj_lib::repo::RewriteRootCommit;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::repo_path::UiPathParseError;
 use jj_lib::revset;
 use jj_lib::revset::RevsetEvaluationError;
 use jj_lib::revset::RevsetParseError;
@@ -56,6 +56,7 @@ use jj_lib::secure_config::SecureConfigError;
 use jj_lib::str_util::StringPatternParseError;
 use jj_lib::trailer::TrailerParseError;
 use jj_lib::transaction::TransactionCommitError;
+use jj_lib::ui_path::UiPathParseError;
 use jj_lib::view::RenameWorkspaceError;
 use jj_lib::working_copy::RecoverWorkspaceError;
 use jj_lib::working_copy::ResetError;
@@ -428,6 +429,19 @@ impl From<WalkPredecessorsError> for CommandError {
     }
 }
 
+impl From<ConvergeError> for CommandError {
+    fn from(err: ConvergeError) -> Self {
+        match err {
+            ConvergeError::Backend(err) => err.into(),
+            ConvergeError::Index(err) => err.into(),
+            ConvergeError::RevsetEvaluation(err) => err.into(),
+            ConvergeError::WalkPredecessors(err) => err.into(),
+            ConvergeError::IO(err) => err.into(),
+            ConvergeError::Other(err) => internal_error(err),
+        }
+    }
+}
+
 impl From<DiffEditError> for CommandError {
     fn from(err: DiffEditError) -> Self {
         user_error_with_message("Failed to edit diff", err)
@@ -508,6 +522,12 @@ impl From<TempTextEditError> for CommandError {
     }
 }
 
+impl From<TempTextEditError> for ConvergeError {
+    fn from(err: TempTextEditError) -> Self {
+        Self::Other(Box::new(err))
+    }
+}
+
 impl From<TrailerParseError> for CommandError {
     fn from(err: TrailerParseError) -> Self {
         user_error(err)
@@ -516,6 +536,7 @@ impl From<TrailerParseError> for CommandError {
 
 #[cfg(feature = "git")]
 mod git {
+    use jj_lib::git::GitCreateWorktreeError;
     use jj_lib::git::GitDefaultRefspecError;
     use jj_lib::git::GitExportError;
     use jj_lib::git::GitFetchError;
@@ -604,6 +625,12 @@ jj currently does not support partial clones. To use jj with this repository, tr
 
     impl From<GitRemoteManagementError> for CommandError {
         fn from(err: GitRemoteManagementError) -> Self {
+            user_error(err)
+        }
+    }
+
+    impl From<GitCreateWorktreeError> for CommandError {
+        fn from(err: GitCreateWorktreeError) -> Self {
             user_error(err)
         }
     }
@@ -943,7 +970,9 @@ fn revset_resolution_error_hints(err: &RevsetResolutionError) -> Vec<String> {
             kind: _,
             symbol: _,
             targets,
-        } => vec![multiple_targets_hint(targets)],
+        } => {
+            vec![multiple_targets_hint(targets)]
+        }
         RevsetResolutionError::EmptyString
         | RevsetResolutionError::WorkspaceMissingWorkingCopy { .. }
         | RevsetResolutionError::AmbiguousCommitIdPrefix(_)

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bstr::BString;
 use itertools::Itertools as _;
 use jj_lib::backend::CopyId;
+use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
 use jj_lib::conflicts;
 use jj_lib::conflicts::ConflictMarkerStyle;
@@ -24,8 +25,8 @@ use jj_lib::merge::Diff;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
-use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::store::Store;
+use jj_lib::ui_path::RepoPathUiConverter;
 use thiserror::Error;
 
 use super::ConflictResolveError;

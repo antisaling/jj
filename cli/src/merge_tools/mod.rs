@@ -23,6 +23,7 @@ use futures::future::try_join_all;
 use jj_lib::backend::BackendError;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::MergedTreeValue;
+use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::TreeValue;
 use jj_lib::config::ConfigGetError;
 use jj_lib::config::ConfigGetResultExt as _;
@@ -39,8 +40,8 @@ use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo_path::InvalidRepoPathError;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::settings::UserSettings;
+use jj_lib::ui_path::RepoPathUiConverter;
 use jj_lib::working_copy::SnapshotError;
 use thiserror::Error;
 

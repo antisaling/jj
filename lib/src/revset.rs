@@ -62,7 +62,6 @@ use crate::ref_name::WorkspaceNameBuf;
 use crate::repo::ReadonlyRepo;
 use crate::repo::Repo;
 use crate::repo::RepoLoaderError;
-use crate::repo_path::RepoPathUiConverter;
 use crate::revset_parser;
 pub use crate::revset_parser::BinaryOp;
 pub use crate::revset_parser::ExpressionKind;
@@ -79,8 +78,10 @@ pub use crate::revset_parser::parse_symbol;
 use crate::store::Store;
 use crate::str_util::StringExpression;
 use crate::str_util::StringPattern;
+use crate::symbol_util::format_string;
 use crate::time_util::DatePattern;
 use crate::time_util::DatePatternContext;
+use crate::ui_path::RepoPathUiConverter;
 
 /// Error occurred during symbol resolution.
 #[derive(Debug, Error)]
@@ -989,8 +990,6 @@ static BUILTIN_FUNCTION_MAP: LazyLock<HashMap<&str, RevsetFunction>> = LazyLock:
         let state = None;
         Ok(RevsetExpression::remote_tags(symbol, state))
     });
-    // TODO: Document tracked/untracked_remote_tags() if we add untracked state
-    // to remote tags.
     map.insert("tracked_remote_tags", |diagnostics, function, context| {
         let symbol = parse_remote_refs_arguments(diagnostics, function, context)?;
         let state = Some(RemoteRefState::Tracked);
@@ -3612,11 +3611,6 @@ pub fn format_symbol(literal: &str) -> String {
     } else {
         format_string(literal)
     }
-}
-
-/// Formats a string by quoting and escaping it.
-pub fn format_string(literal: &str) -> String {
-    format!(r#""{}""#, dsl_util::escape_string(literal))
 }
 
 /// Formats a `name@remote` symbol, applies quoting and escaping if necessary.

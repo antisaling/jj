@@ -68,6 +68,7 @@ use crate::backend::BackendError;
 use crate::backend::CopyId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
+use crate::backend::MergedTreeValueExt as _;
 use crate::backend::MillisSinceEpoch;
 use crate::backend::SymlinkId;
 use crate::backend::TreeId;
@@ -981,6 +982,7 @@ fn file_state(metadata: &Metadata) -> Result<Option<FileState>, MtimeOutOfRange>
 struct FsmonitorMatcher {
     matcher: Option<Box<dyn Matcher>>,
     watchman_clock: Option<crate::protos::local_working_copy::WatchmanClock>,
+    should_update_watchman_clock: bool,
 }
 
 /// Settings specific to the tree state of the [`LocalWorkingCopy`] backend.
@@ -1355,11 +1357,11 @@ impl TreeState {
 
         let sparse_matcher = self.sparse_matcher();
 
-        let fsmonitor_clock_needs_save = self.fsmonitor_settings != FsmonitorSettings::None;
-        let mut is_dirty = fsmonitor_clock_needs_save;
+        let mut is_dirty = false;
         let FsmonitorMatcher {
             matcher: fsmonitor_matcher,
             watchman_clock,
+            should_update_watchman_clock,
         } = self
             .make_fsmonitor_matcher(&self.fsmonitor_settings)
             .await?;
@@ -1374,7 +1376,10 @@ impl TreeState {
         );
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
-            self.watchman_clock = watchman_clock;
+            if should_update_watchman_clock {
+                is_dirty |= self.watchman_clock != watchman_clock;
+                self.watchman_clock = watchman_clock;
+            }
             return Ok((is_dirty, SnapshotStats::default()));
         }
 
@@ -1475,12 +1480,17 @@ impl TreeState {
         // Since untracked paths aren't cached in the tree state, we'll need to
         // rescan the working directory changes to report or track them later.
         // TODO: store untracked paths and update watchman_clock?
-        if (stats.untracked_paths.is_empty() && stats.invalid_utf8_paths.is_empty())
-            || watchman_clock.is_none()
-        {
-            self.watchman_clock = watchman_clock;
-        } else {
-            tracing::info!("not updating watchman clock because there are untracked files");
+        // A failed monitor query has no clock and causes a full scan. Clear the
+        // old clock after that scan even if it found untracked paths.
+        if should_update_watchman_clock {
+            if (stats.untracked_paths.is_empty() && stats.invalid_utf8_paths.is_empty())
+                || watchman_clock.is_none()
+            {
+                is_dirty |= self.watchman_clock != watchman_clock;
+                self.watchman_clock = watchman_clock;
+            } else {
+                tracing::info!("not updating watchman clock because there are untracked files");
+            }
         }
         Ok((is_dirty, stats))
     }
@@ -1511,6 +1521,13 @@ impl TreeState {
                 });
             }
         };
+        // Do not advance the clock when the monitor reports no changed paths.
+        // This avoids rewriting the tree state just to save the new clock.
+        // Reusing the older clock may make a later query do more work, but it
+        // cannot omit changes.
+        let should_update_watchman_clock = changed_files
+            .as_ref()
+            .is_none_or(|changed_files| !changed_files.is_empty());
         let matcher: Option<Box<dyn Matcher>> = match changed_files {
             None => None,
             Some(changed_files) => {
@@ -1548,6 +1565,7 @@ impl TreeState {
         Ok(FsmonitorMatcher {
             matcher,
             watchman_clock,
+            should_update_watchman_clock,
         })
     }
 }
@@ -2629,12 +2647,14 @@ impl TreeState {
     ) -> &'a mut std::process::Command {
         if let Ok(git_backend) = crate::git::get_git_backend(self.store.as_ref()) {
             let git_work_tree = git_backend
-                .git_workdir()
-                .unwrap_or(self.working_copy_path.as_path());
+                .open_git_repo_at_workdir(&self.working_copy_path)
+                .ok()
+                .and_then(|git_repo| git_repo.workdir().map(PathBuf::from))
+                .unwrap_or_else(|| self.working_copy_path.clone());
             command
                 .env("GIT_DIR", git_backend.git_repo_path())
-                .env("GIT_WORK_TREE", git_work_tree)
-                .current_dir(git_work_tree)
+                .env("GIT_WORK_TREE", &git_work_tree)
+                .current_dir(&git_work_tree)
         } else {
             command.current_dir(&self.working_copy_path)
         }

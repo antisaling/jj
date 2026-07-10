@@ -27,6 +27,9 @@ These are listed in the order they are loaded; the settings from earlier items
 in the list are overridden by the settings from later items if they disagree.
 Every type of config except for the built-in settings is optional.
 
+Individual config files can also be targeted with
+`jj config {edit,set,unset} --file <PATH>`.
+
 You can enable JSON Schema validation in your editor by adding a `#:schema`
 reference at the top of your TOML config files. See [JSON Schema Support] for
 details.
@@ -577,8 +580,8 @@ page](conflicts.md#conflict-markers).
 You can configure the set of immutable commits via
 `revset-aliases."immutable_heads()"`. The default set of immutable heads is
 `builtin_immutable_heads()`, which in turn is defined as `trunk() | tags() |
-untracked_remote_bookmarks()`. For example, to also consider the
-`release@origin` bookmark immutable:
+untracked_remote_bookmarks() | untracked_remote_tags()`. For example, to also
+consider the `release@origin` bookmark immutable:
 
 ```toml
 [revset-aliases]
@@ -1773,6 +1776,23 @@ default. Set `git.colocate` to `false` to disable it.
 See [Colocated Jujutsu/Git workspaces](git-compatibility.md#colocated-jujutsugit-repos)
 for more information.
 
+### Ignoring files by .gitattributes filter
+
+In Git-backed repositories, `jj` can skip files during snapshot based on the
+`filter` attribute in `.gitattributes`. The `git.ignore-filters` setting lists
+the filter values to skip, and defaults to [`lfs`].
+
+```toml
+[git]
+ignore-filters = ["lfs", "git-crypt"]
+```
+
+This only affects snapshotting from disk to the store. Checkout still writes
+the files from the tree, so external tools such as `git lfs pull` or
+`git lfs checkout` can hydrate them afterward. Files already tracked by `jj` may
+need to be removed with `jj file untrack <path>` before this setting affects
+future snapshots.
+
 ### Default object hash format
 
 Traditionally, Git used the SHA-1 hash function to compute the identifiers for
@@ -1789,7 +1809,6 @@ all code forges support SHA-256 repositories yet.
 
 [objects]: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects
 [transition]: https://git-scm.com/docs/hash-function-transition
-
 ### Default remotes for `jj git fetch` and `jj git push`
 
 By default, if a single remote exists it is used for `jj git fetch` and `jj git
@@ -1997,22 +2016,46 @@ you can:
 executable-path = "/path/to/git"
 ```
 
-### Ignoring files by `.gitattributes` filter
+## Gerrit settings
 
-In Git-backed repositories, `jj` can skip files during snapshot based on the
-`filter` attribute in `.gitattributes`. The `git.ignore-filters` setting lists
-the filter values to skip, and defaults to `["lfs"]`.
+### Default remote
+
+To configure the default remote that `jj gerrit upload` will push to, set
+`gerrit.default-remote`. This can be overridden with the `--remote` option.
 
 ```toml
-[git]
-ignore-filters = ["lfs", "git-crypt"]
+[gerrit]
+default-remote = "gerrit"
 ```
 
-This only affects snapshotting from disk to the store. Checkout still writes
-the files from the tree, so external tools such as `git lfs pull` or
-`git lfs checkout` can hydrate them afterward. Files already tracked by `jj` may
-need to be removed with `jj file untrack <path>` before this setting affects
-future snapshots.
+### Default remote branch
+
+To configure the default branch that `jj gerrit upload` will push to, set
+`gerrit.default-remote-branch`. This can be overridden with the
+`--remote-branch` option.
+
+```toml
+[gerrit]
+default-remote-branch = "main"
+```
+
+### `Link` trailer
+
+Since version 3.3.1 Gerrit supports an alternative to the `Change-Id` trailer,
+using a [`Link` trailer][Gerrit Link trailer] in the format of
+`<review-url>/id/I<change-id>`. To have `jj gerrit upload` automatically add a
+`Link` trailer instead of a `Change-Id` trailer, set `gerrit.review-url` to the
+URL preview you'd like to use.
+
+```toml
+[gerrit]
+review-url = "https://review.gerrithub.io/your/project"
+```
+
+Note that if a `Change-Id` or `Link` trailer already exists in a change, then
+`jj gerrit upload` will not add any trailer.
+
+[Gerrit Link trailer]: https://gerrit-documentation.storage.googleapis.com/Documentation/3.3.1/cmd-hook-commit-msg.html
 
 ## Merge settings
 
@@ -2044,6 +2087,19 @@ different results depending on the order of merging. To turn it off, set
 ```toml
 [merge]
 same-change = "accept"
+```
+
+## Converge settings
+
+The `jj converge` command attempts to resolve divergence by replacing two or
+more divergent commits with a single commit. The command accepts a
+`--revisions REVSET` argument, and looks for divergence within the commits that
+match that revset. The `--revisions` argument is optional. By default
+`jj converge` uses the `revsets.converge` revset:
+
+```toml
+[revsets]
+converge = "mutable() & divergent()"
 ```
 
 ## Filesystem monitor
@@ -2243,7 +2299,10 @@ recommended for better integration with platform services.
 
 The files in the `conf.d` directory are loaded in lexicographic order. This
 allows configs to be split across multiple files and combines well with
-[Conditional Variables](#conditional-variables).
+[Conditional Variables](#conditional-variables). Modifying user configuration
+with `jj config {edit,set,unset} --user` targets the primary user config file
+(or the first loaded file in `conf.d/`). Individual files in `conf.d/` can be
+targeted with `--file <PATH>`.
 
 | Platform        | Location of `<PLATFORM_SPECIFIC>` dir | Example config file location                              |
 | :-------------- | :------------------------------------ | :-------------------------------------------------------- |
@@ -2284,6 +2343,9 @@ the following precedence order (with later configs overriding earlier ones).
 
 These configs can be overridden by [the user config files], and will be disabled
 in favor of the `JJ_CONFIG` environment variable if it is set.
+
+Existing system config files loaded by `jj` can be edited using
+`jj config {edit,set,unset} --file <PATH>`.
 
 ### JSON Schema Support
 
@@ -2413,6 +2475,15 @@ work = "heads(::@ ~ description(''))::"
 
 [aliases]
 wip = ["log", "-r", "work"]
+```
+
+You can modify specific configuration files such as those in
+`conf.d/` directly using the `--file` option (the file will be created if it
+doesn't already exist):
+
+```shell
+jj config set --file ~/.config/jj/conf.d/work.toml user.email "YOUR_WORK_EMAIL@workplace.com"
+jj config edit --file ~/.config/jj/conf.d/work.toml
 ```
 
 #### Available condition keys

@@ -35,6 +35,7 @@ use jj_lib::backend::BackendResult;
 use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::MergedTreeValue;
+use jj_lib::backend::MergedTreeValueExt as _;
 use jj_lib::backend::Timestamp;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
@@ -67,7 +68,6 @@ use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo;
 use jj_lib::repo::RepoLoader;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::revset;
 use jj_lib::revset::Revset;
 use jj_lib::revset::RevsetContainingFn;
@@ -83,6 +83,7 @@ use jj_lib::signing::Verification;
 use jj_lib::store::Store;
 use jj_lib::trailer;
 use jj_lib::trailer::Trailer;
+use jj_lib::ui_path::RepoPathUiConverter;
 use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
 use jj_lib::workspace::WorkspaceLoaderFactory as _;
 use jj_lib::workspace_store::SimpleWorkspaceStore;
@@ -128,6 +129,8 @@ use crate::templater::Template;
 use crate::templater::TemplateFormatter;
 use crate::templater::TemplatePropertyError;
 use crate::templater::TemplatePropertyExt as _;
+use crate::templater::list_to_boolean;
+use crate::templater::option_to_boolean;
 
 pub trait CommitTemplateLanguageExtension {
     fn build_fn_table<'repo>(&self) -> CommitTemplateBuildFnTable<'repo>;
@@ -247,11 +250,8 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
                 build(self, diagnostics, build_ctx, property, function)
             }
             CommitTemplatePropertyKind::CommitOpt(property) => {
-                let type_name = "Commit";
-                let table = &self.build_fn_table.commit_methods;
-                let build = template_parser::lookup_method(type_name, table, function)?;
-                let inner_property = property.try_unwrap(type_name).into_dyn();
-                build(self, diagnostics, build_ctx, inner_property, function)
+                let inner_property = property.try_unwrap(type_name).into_dyn_wrapped();
+                self.build_method(diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::CommitList(property) => {
                 let table = &self.build_fn_table.commit_list_methods;
@@ -269,11 +269,8 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
                 build(self, diagnostics, build_ctx, property, function)
             }
             CommitTemplatePropertyKind::CommitRefOpt(property) => {
-                let type_name = "CommitRef";
-                let table = &self.build_fn_table.commit_ref_methods;
-                let build = template_parser::lookup_method(type_name, table, function)?;
-                let inner_property = property.try_unwrap(type_name).into_dyn();
-                build(self, diagnostics, build_ctx, inner_property, function)
+                let inner_property = property.try_unwrap(type_name).into_dyn_wrapped();
+                self.build_method(diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::CommitRefList(property) => {
                 let table = &self.build_fn_table.commit_ref_list_methods;
@@ -286,11 +283,8 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
                 build(self, diagnostics, build_ctx, property, function)
             }
             CommitTemplatePropertyKind::WorkspaceRefOpt(property) => {
-                let type_name = "WorkspaceRef";
-                let table = &self.build_fn_table.workspace_ref_methods;
-                let build = template_parser::lookup_method(type_name, table, function)?;
-                let inner_property = property.try_unwrap(type_name).into_dyn();
-                build(self, diagnostics, build_ctx, inner_property, function)
+                let inner_property = property.try_unwrap(type_name).into_dyn_wrapped();
+                self.build_method(diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::WorkspaceRefList(property) => {
                 let table = &self.build_fn_table.workspace_ref_list_methods;
@@ -298,20 +292,15 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
                 build(self, diagnostics, build_ctx, property, function)
             }
             CommitTemplatePropertyKind::RefSymbol(property) => {
+                // Forward to String methods, but the type_name is "RefSymbol"
                 let table = &self.build_fn_table.core.string_methods;
                 let build = template_parser::lookup_method(type_name, table, function)?;
                 let inner_property = property.map(|RefSymbolBuf(s)| s).into_dyn();
                 build(self, diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::RefSymbolOpt(property) => {
-                let type_name = "RefSymbol";
-                let table = &self.build_fn_table.core.string_methods;
-                let build = template_parser::lookup_method(type_name, table, function)?;
-                let inner_property = property
-                    .try_unwrap(type_name)
-                    .map(|RefSymbolBuf(s)| s)
-                    .into_dyn();
-                build(self, diagnostics, build_ctx, inner_property, function)
+                let inner_property = property.try_unwrap(type_name).into_dyn_wrapped();
+                self.build_method(diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::RepoPath(property) => {
                 let table = &self.build_fn_table.repo_path_methods;
@@ -319,11 +308,8 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
                 build(self, diagnostics, build_ctx, property, function)
             }
             CommitTemplatePropertyKind::RepoPathOpt(property) => {
-                let type_name = "RepoPath";
-                let table = &self.build_fn_table.repo_path_methods;
-                let build = template_parser::lookup_method(type_name, table, function)?;
-                let inner_property = property.try_unwrap(type_name).into_dyn();
-                build(self, diagnostics, build_ctx, inner_property, function)
+                let inner_property = property.try_unwrap(type_name).into_dyn_wrapped();
+                self.build_method(diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::ChangeId(property) => {
                 let table = &self.build_fn_table.change_id_methods;
@@ -383,15 +369,16 @@ impl<'repo> TemplateLanguage<'repo> for CommitTemplateLanguage<'repo> {
                 let build = template_parser::lookup_method(type_name, table, function)?;
                 build(self, diagnostics, build_ctx, property, function)
             }
-            CommitTemplatePropertyKind::CryptographicSignatureOpt(property) => {
-                let type_name = "CryptographicSignature";
+            CommitTemplatePropertyKind::CryptographicSignature(property) => {
                 let table = &self.build_fn_table.cryptographic_signature_methods;
                 let build = template_parser::lookup_method(type_name, table, function)?;
-                let inner_property = property.try_unwrap(type_name).into_dyn();
-                build(self, diagnostics, build_ctx, inner_property, function)
+                build(self, diagnostics, build_ctx, property, function)
+            }
+            CommitTemplatePropertyKind::CryptographicSignatureOpt(property) => {
+                let inner_property = property.try_unwrap(type_name).into_dyn_wrapped();
+                self.build_method(diagnostics, build_ctx, inner_property, function)
             }
             CommitTemplatePropertyKind::AnnotationLine(property) => {
-                let type_name = "AnnotationLine";
                 let table = &self.build_fn_table.annotation_line_methods;
                 let build = template_parser::lookup_method(type_name, table, function)?;
                 build(self, diagnostics, build_ctx, property, function)
@@ -469,6 +456,7 @@ pub enum CommitTemplatePropertyKind<'repo> {
     DiffStats(BoxedTemplateProperty<'repo, DiffStatsFormatted<'repo>>),
     DiffStatEntry(BoxedTemplateProperty<'repo, DiffStatEntry>),
     DiffStatEntryList(BoxedTemplateProperty<'repo, Vec<DiffStatEntry>>),
+    CryptographicSignature(BoxedTemplateProperty<'repo, CryptographicSignature>),
     CryptographicSignatureOpt(BoxedTemplateProperty<'repo, Option<CryptographicSignature>>),
     AnnotationLine(BoxedTemplateProperty<'repo, AnnotationLine>),
     Trailer(BoxedTemplateProperty<'repo, Trailer>),
@@ -503,6 +491,7 @@ template_builder::impl_property_wrappers!(<'repo> CommitTemplatePropertyKind<'re
     DiffStats(DiffStatsFormatted<'repo>),
     DiffStatEntry(DiffStatEntry),
     DiffStatEntryList(Vec<DiffStatEntry>),
+    CryptographicSignature(CryptographicSignature),
     CryptographicSignatureOpt(Option<CryptographicSignature>),
     AnnotationLine(AnnotationLine),
     Trailer(Trailer),
@@ -551,6 +540,7 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             Self::DiffStats(_) => "DiffStats",
             Self::DiffStatEntry(_) => "DiffStatEntry",
             Self::DiffStatEntryList(_) => "List<DiffStatEntry>",
+            Self::CryptographicSignature(_) => "CryptographicSignature",
             Self::CryptographicSignatureOpt(_) => "Option<CryptographicSignature>",
             Self::AnnotationLine(_) => "AnnotationLine",
             Self::Trailer(_) => "Trailer",
@@ -583,19 +573,19 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             Self::Core(property) => property.try_into_boolean().map_err(Self::Core),
             Self::Operation(property) => property.try_into_boolean().map_err(Self::Operation),
             Self::Commit(_) => Err(self),
-            Self::CommitOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::CommitList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::CommitOpt(property) => Ok(option_to_boolean(property)),
+            Self::CommitList(property) => Ok(list_to_boolean(property)),
             Self::CommitEvolutionEntry(_) => Err(self),
             Self::CommitRef(_) => Err(self),
-            Self::CommitRefOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::CommitRefList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::CommitRefOpt(property) => Ok(option_to_boolean(property)),
+            Self::CommitRefList(property) => Ok(list_to_boolean(property)),
             Self::WorkspaceRef(_) => Err(self),
-            Self::WorkspaceRefOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
-            Self::WorkspaceRefList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::WorkspaceRefOpt(property) => Ok(option_to_boolean(property)),
+            Self::WorkspaceRefList(property) => Ok(list_to_boolean(property)),
             Self::RefSymbol(_) => Err(self),
-            Self::RefSymbolOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::RefSymbolOpt(property) => Ok(option_to_boolean(property)),
             Self::RepoPath(_) => Err(self),
-            Self::RepoPathOpt(property) => Ok(property.map(|opt| opt.is_some()).into_dyn()),
+            Self::RepoPathOpt(property) => Ok(option_to_boolean(property)),
             Self::ChangeId(_) => Err(self),
             Self::CommitId(_) => Err(self),
             Self::ShortestIdPrefix(_) => Err(self),
@@ -603,18 +593,17 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             // diff.empty() method might be better.
             Self::TreeDiff(_) => Err(self),
             Self::TreeDiffEntry(_) => Err(self),
-            Self::TreeDiffEntryList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::TreeDiffEntryList(property) => Ok(list_to_boolean(property)),
             Self::TreeEntry(_) => Err(self),
-            Self::TreeEntryList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::TreeEntryList(property) => Ok(list_to_boolean(property)),
             Self::DiffStats(_) => Err(self),
             Self::DiffStatEntry(_) => Err(self),
-            Self::DiffStatEntryList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
-            Self::CryptographicSignatureOpt(property) => {
-                Ok(property.map(|sig| sig.is_some()).into_dyn())
-            }
+            Self::DiffStatEntryList(property) => Ok(list_to_boolean(property)),
+            Self::CryptographicSignature(_) => Err(self),
+            Self::CryptographicSignatureOpt(property) => Ok(option_to_boolean(property)),
             Self::AnnotationLine(_) => Err(self),
             Self::Trailer(_) => Err(self),
-            Self::TrailerList(property) => Ok(property.map(|l| !l.is_empty()).into_dyn()),
+            Self::TrailerList(property) => Ok(list_to_boolean(property)),
         }
     }
 
@@ -663,6 +652,7 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             Self::DiffStats(_) => None,
             Self::DiffStatEntry(_) => None,
             Self::DiffStatEntryList(_) => None,
+            Self::CryptographicSignature(_) => None,
             Self::CryptographicSignatureOpt(_) => None,
             Self::AnnotationLine(_) => None,
             Self::Trailer(_) => None,
@@ -699,6 +689,7 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             Self::DiffStats(property) => Some(property.into_template()),
             Self::DiffStatEntry(_) => None,
             Self::DiffStatEntryList(_) => None,
+            Self::CryptographicSignature(_) => None,
             Self::CryptographicSignatureOpt(_) => None,
             Self::AnnotationLine(_) => None,
             Self::Trailer(property) => Some(property.into_template()),
@@ -768,6 +759,7 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             (Self::DiffStats(_), _) => None,
             (Self::DiffStatEntry(_), _) => None,
             (Self::DiffStatEntryList(_), _) => None,
+            (Self::CryptographicSignature(_), _) => None,
             (Self::CryptographicSignatureOpt(_), _) => None,
             (Self::AnnotationLine(_), _) => None,
             (Self::Trailer(_), _) => None,
@@ -810,6 +802,7 @@ impl<'repo> CoreTemplatePropertyVar<'repo> for CommitTemplatePropertyKind<'repo>
             (Self::DiffStats(_), _) => None,
             (Self::DiffStatEntry(_), _) => None,
             (Self::DiffStatEntryList(_), _) => None,
+            (Self::CryptographicSignature(_), _) => None,
             (Self::CryptographicSignatureOpt(_), _) => None,
             (Self::AnnotationLine(_), _) => None,
             (Self::Trailer(_), _) => None,

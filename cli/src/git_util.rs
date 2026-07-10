@@ -20,6 +20,7 @@ use std::io::Write as _;
 use std::iter;
 use std::mem;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -40,10 +41,13 @@ use jj_lib::git::GitRefKind;
 use jj_lib::git::GitSettings;
 use jj_lib::git::GitSidebandLineTerminator;
 use jj_lib::git::GitSubprocessCallback;
+use jj_lib::git::GitSubprocessOptions;
+use jj_lib::git_backend::GitRepoAtWorkdirError;
 use jj_lib::op_store::RemoteRefState;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
 use jj_lib::settings::RemoteSettingsMap;
+use jj_lib::store::Store;
 use jj_lib::workspace::Workspace;
 use unicode_width::UnicodeWidthStr as _;
 
@@ -52,6 +56,7 @@ use crate::cli_util::WorkspaceCommandTransaction;
 use crate::cli_util::print_updated_commits;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
+use crate::command_error::print_error_sources;
 use crate::command_error::user_error;
 use crate::formatter::Formatter;
 use crate::formatter::FormatterExt as _;
@@ -59,22 +64,16 @@ use crate::revset_util::parse_remote_auto_track_bookmarks_map;
 use crate::ui::ProgressOutput;
 use crate::ui::Ui;
 
-pub fn is_colocated_git_workspace(workspace: &Workspace) -> bool {
+pub fn is_colocated_git_workspace(workspace: &Workspace) -> Result<bool, CommandError> {
     let Ok(git_backend) = git::get_git_backend(workspace.repo_loader().store()) else {
-        return false;
+        return Ok(false);
     };
-    let Some(git_workdir) = git_backend.git_workdir() else {
-        return false; // Bare repository
-    };
-    if git_workdir == workspace.workspace_root() {
-        return true;
+    match git_backend.open_git_repo_at_workdir(workspace.workspace_root()) {
+        Ok(_) => Ok(true),
+        Err(GitRepoAtWorkdirError::NotFound { .. }) => Ok(false),
+        Err(GitRepoAtWorkdirError::Unrelated { .. }) => Ok(false),
+        Err(err @ GitRepoAtWorkdirError::Other(_)) => Err(user_error(err)),
     }
-    // Colocated workspace should have ".git" directory, file, or symlink. Compare
-    // its parent as the git_workdir might be resolved from the real ".git" path.
-    let Ok(dot_git_path) = dunce::canonicalize(workspace.workspace_root().join(".git")) else {
-        return false;
-    };
-    dunce::canonicalize(git_workdir).ok().as_deref() == dot_git_path.parent()
 }
 
 /// Parses user-specified remote URL or path to absolute form.
@@ -560,6 +559,36 @@ pub fn print_push_stats(ui: &Ui, stats: &GitPushStats) -> io::Result<()> {
                 write!(formatter, ": {err}")?;
             }
             writeln!(formatter)?;
+        }
+    }
+    Ok(())
+}
+
+/// Disconnects the Git worktree backing a jj workspace, if there is one.
+///
+/// The workspace has already been forgotten by the time this runs, and a
+/// leftover gitlink or stale worktree metadata isn't worth failing the command
+/// over, so errors are reported as warnings.
+pub fn unlink_git_worktree(
+    ui: &Ui,
+    store: &Arc<Store>,
+    subprocess_options: GitSubprocessOptions,
+    worktree_path: &Path,
+) -> Result<(), CommandError> {
+    match git::unlink_worktree(store, subprocess_options, worktree_path) {
+        Ok(false) => {}
+        Ok(true) => writeln!(
+            ui.status(),
+            r#"Removed Git worktree for "{}"."#,
+            worktree_path.display()
+        )?,
+        Err(err) => {
+            writeln!(
+                ui.warning_default(),
+                r#"Failed to remove Git worktree for "{}"."#,
+                worktree_path.display()
+            )?;
+            print_error_sources(ui, Some(&err))?;
         }
     }
     Ok(())
