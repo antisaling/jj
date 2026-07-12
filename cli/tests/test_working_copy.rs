@@ -263,6 +263,50 @@ fn test_snapshot_tracked_file_switches_to_lfs_after_gitattributes_change() {
     );
 }
 
+#[test]
+fn test_snapshot_tracked_file_switches_from_lfs_after_gitattributes_change() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file(".gitattributes", "");
+    work_dir.write_file("asset.bin", "binary payload\n");
+    work_dir.run_jj(["commit", "-m", "before lfs"]).success();
+
+    work_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    work_dir.run_jj(["commit", "-m", "with lfs"]).success();
+    let pointer = work_dir
+        .run_jj(["file", "show", "-r", "@-", "asset.bin"])
+        .success()
+        .stdout
+        .into_raw();
+    assert!(
+        pointer.contains("version https://git-lfs.github.com/spec/v1"),
+        "expected intermediate commit to contain an LFS pointer, got:\n{pointer}"
+    );
+
+    work_dir.write_file(".gitattributes", "");
+    let disk_asset = std::fs::read_to_string(work_dir.root().join("asset.bin")).unwrap();
+    assert_eq!(disk_asset, "binary payload\n");
+    work_dir.run_jj(["status"]).success();
+    let output = work_dir.run_jj(["diff", "--git"]);
+    let stdout = output.stdout.raw();
+    assert!(
+        stdout.contains("diff --git a/asset.bin b/asset.bin"),
+        "expected asset.bin diff, got:\n{output}"
+    );
+    assert!(
+        stdout.contains("-version https://git-lfs.github.com/spec/v1"),
+        "expected LFS pointer removal, got:\n{output}"
+    );
+    assert!(
+        stdout.contains("+binary payload"),
+        "expected disk content to be snapshotted, got:\n{output}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_snapshot_lfs_preserves_executable_mode() {
