@@ -1408,11 +1408,15 @@ impl TreeState {
                 maybe_changed_gitattributes_dirs: Mutex::new(HashMap::new()),
                 ignore_filters: self.ignore_filters.clone(),
             };
+            let gitattributes_changed = snapshotter
+                .maybe_changed_gitattributes_in_directory(&RepoPath::root())
+                .block_on()?;
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
                 disk_dir: self.working_copy_path.clone(),
                 git_ignore: base_ignores.clone(),
                 file_states: self.file_states.all(),
+                gitattributes_changed,
             };
             // Here we use scope as a queue of per-directory jobs.
             rayon::scope(|scope| {
@@ -1553,6 +1557,7 @@ struct DirectoryToVisit<'a> {
     disk_dir: PathBuf,
     git_ignore: Arc<GitIgnoreFile>,
     file_states: FileStates<'a>,
+    gitattributes_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1697,7 +1702,10 @@ impl FileSnapshotter<'_> {
         } else {
             None
         };
-        Ok(Some(disk_contents) != current_contents)
+        Ok(!gitattributes_contents_equal(
+            &disk_contents,
+            current_contents.as_deref(),
+        ))
     }
 
     /// Visits the directory entries, spawns jobs to recurse into sub
@@ -1712,6 +1720,7 @@ impl FileSnapshotter<'_> {
             disk_dir,
             git_ignore,
             file_states,
+            gitattributes_changed,
         } = directory_to_visit;
 
         let git_ignore = git_ignore.chain_with_file(&dir, disk_dir.join(".gitignore"))?;
@@ -1728,9 +1737,16 @@ impl FileSnapshotter<'_> {
             // sequential scan should be fast enough.
             .with_min_len(100)
             .filter_map(|entry| {
-                self.process_dir_entry(&dir, &git_ignore, file_states, &entry, scope)
-                    .block_on()
-                    .transpose()
+                self.process_dir_entry(
+                    &dir,
+                    &git_ignore,
+                    file_states,
+                    gitattributes_changed,
+                    &entry,
+                    scope,
+                )
+                .block_on()
+                .transpose()
             })
             .map(|item| match item {
                 Ok((PresentDirEntryKind::Dir, name)) => Ok(Either::Left(name)),
@@ -1748,6 +1764,7 @@ impl FileSnapshotter<'_> {
         dir: &RepoPath,
         git_ignore: &Arc<GitIgnoreFile>,
         file_states: FileStates<'scope>,
+        gitattributes_changed: bool,
         entry: &DirEntry,
         scope: &rayon::Scope<'scope>,
     ) -> Result<Option<(PresentDirEntryKind, String)>, SnapshotError> {
@@ -1792,6 +1809,8 @@ impl FileSnapshotter<'_> {
                 }
             }
 
+            let child_gitattributes_changed =
+                self.maybe_changed_gitattributes_in_directory(&path).await?;
             if git_ignore.matches_dir(&path)
                 && self.force_tracking_matcher.visit(&path).is_nothing()
             {
@@ -1803,12 +1822,13 @@ impl FileSnapshotter<'_> {
                 self.spawn_ok(scope, move |_| {
                     self.visit_tracked_files(file_states).block_on()
                 });
-            } else if !self.matcher.visit(&path).is_nothing() {
+            } else if gitattributes_changed || !self.matcher.visit(&path).is_nothing() {
                 let directory_to_visit = DirectoryToVisit {
                     dir: path,
                     disk_dir,
                     git_ignore: git_ignore.clone(),
                     file_states,
+                    gitattributes_changed: child_gitattributes_changed,
                 };
                 self.spawn_ok(scope, |scope| {
                     self.visit_directory(directory_to_visit, scope)
@@ -1817,7 +1837,7 @@ impl FileSnapshotter<'_> {
             // Whether or not the directory path matches, any child file entries
             // shouldn't be touched within the current recursion step.
             Ok(Some((PresentDirEntryKind::Dir, name_string)))
-        } else if self.matcher.matches(&path) {
+        } else if gitattributes_changed || self.matcher.matches(&path) {
             if let Some(progress) = self.progress {
                 progress(&path);
             }
@@ -1833,8 +1853,6 @@ impl FileSnapshotter<'_> {
                 {
                     let clean = new_file_state.is_clean(current_file_state)
                         && current_file_state.mtime < self.tree_state.own_mtime;
-                    let gitattributes_changed =
-                        self.maybe_changed_gitattributes_in_directory(dir).await?;
                     if clean && !gitattributes_changed {
                         return Ok(Some((PresentDirEntryKind::File, name_string)));
                     }
@@ -1842,30 +1860,32 @@ impl FileSnapshotter<'_> {
                         .git_attributes
                         .filter_matches(&path, &self.ignore_filters, SearchPriority::Disk)
                         .block_on()?;
+                    let lfs_filter_matches = self.ignore_filters.contains("lfs")
+                        && self
+                            .git_attributes
+                            .lfs_filter_matches(&path, &self.ignore_filters, SearchPriority::Disk)
+                            .block_on();
+                    let current_tree_uses_lfs_pointer =
+                        gitattributes_changed && self.current_tree_uses_lfs_pointer(&path).await?;
+                    let force_lfs_resnapshot = clean
+                        && gitattributes_changed
+                        && lfs_filter_matches
+                        && !current_tree_uses_lfs_pointer;
+                    let force_regular_resnapshot = clean
+                        && gitattributes_changed
+                        && !filter_matches
+                        && current_tree_uses_lfs_pointer;
+                    if clean && !force_lfs_resnapshot && !force_regular_resnapshot {
+                        return Ok(Some((PresentDirEntryKind::File, name_string)));
+                    }
                     if filter_matches {
-                        let lfs_filter_matches = self.ignore_filters.contains("lfs")
-                            && self
-                                .git_attributes
-                                .lfs_filter_matches(
-                                    &path,
-                                    &self.ignore_filters,
-                                    SearchPriority::Disk,
-                                )
-                                .block_on();
-                        let force_resnapshot = clean
-                            && gitattributes_changed
-                            && lfs_filter_matches
-                            && !self.current_tree_uses_lfs_pointer(&path).await?;
-                        if clean && !force_resnapshot {
-                            return Ok(Some((PresentDirEntryKind::File, name_string)));
-                        }
                         if lfs_filter_matches {
                             self.snapshot_lfs_file(
                                 &path,
                                 &entry.path(),
                                 Some(current_file_state),
                                 new_file_state,
-                                force_resnapshot,
+                                force_lfs_resnapshot,
                             )
                             .await?;
                         } else {
@@ -1873,14 +1893,12 @@ impl FileSnapshotter<'_> {
                             return Ok(None);
                         }
                     } else {
-                        if clean {
-                            return Ok(Some((PresentDirEntryKind::File, name_string)));
-                        }
                         self.process_present_file(
                             path,
                             &entry.path(),
                             Some(current_file_state),
                             new_file_state,
+                            force_regular_resnapshot,
                         )
                         .await?;
                     }
@@ -1958,7 +1976,7 @@ impl FileSnapshotter<'_> {
                 } else if let Some(new_file_state) = file_state(&metadata)
                     .map_err(|err| snapshot_error_for_mtime_out_of_range(err, &entry.path()))?
                 {
-                    self.process_present_file(path, &entry.path(), None, new_file_state)
+                    self.process_present_file(path, &entry.path(), None, new_file_state, false)
                         .await?;
                     Ok(Some((PresentDirEntryKind::File, name_string)))
                 } else {
@@ -2010,28 +2028,27 @@ impl FileSnapshotter<'_> {
             if clean && !gitattributes_changed {
                 continue;
             }
-
             let filter_matches = self
                 .git_attributes
                 .filter_matches(tracked_path, &self.ignore_filters, SearchPriority::Disk)
                 .await?;
+            let lfs_filter_matches = self.ignore_filters.contains("lfs")
+                && self
+                    .git_attributes
+                    .lfs_filter_matches(tracked_path, &self.ignore_filters, SearchPriority::Disk)
+                    .await;
+            let current_tree_uses_lfs_pointer =
+                gitattributes_changed && self.current_tree_uses_lfs_pointer(tracked_path).await?;
+            let force_lfs_resnapshot = clean
+                && gitattributes_changed
+                && lfs_filter_matches
+                && !current_tree_uses_lfs_pointer;
+            let force_regular_resnapshot =
+                clean && gitattributes_changed && !filter_matches && current_tree_uses_lfs_pointer;
+            if clean && !force_lfs_resnapshot && !force_regular_resnapshot {
+                continue;
+            }
             if filter_matches {
-                let lfs_filter_matches = self.ignore_filters.contains("lfs")
-                    && self
-                        .git_attributes
-                        .lfs_filter_matches(
-                            tracked_path,
-                            &self.ignore_filters,
-                            SearchPriority::Disk,
-                        )
-                        .await;
-                let force_resnapshot = clean
-                    && gitattributes_changed
-                    && lfs_filter_matches
-                    && !self.current_tree_uses_lfs_pointer(tracked_path).await?;
-                if clean && !force_resnapshot {
-                    continue;
-                }
                 if lfs_filter_matches {
                     // LFS-filtered tracked file: update via git-lfs clean.
                     self.snapshot_lfs_file(
@@ -2039,19 +2056,17 @@ impl FileSnapshotter<'_> {
                         &disk_path,
                         Some(&current_file_state),
                         new_file_state,
-                        force_resnapshot,
+                        force_lfs_resnapshot,
                     )
                     .await?;
                 }
             } else {
-                if clean {
-                    continue;
-                }
                 self.process_present_file(
                     tracked_path.to_owned(),
                     &disk_path,
                     Some(&current_file_state),
                     new_file_state,
+                    force_regular_resnapshot,
                 )
                 .await?;
             }
@@ -2238,9 +2253,16 @@ impl FileSnapshotter<'_> {
         disk_path: &Path,
         maybe_current_file_state: Option<&FileState>,
         mut new_file_state: FileState,
+        force_resnapshot: bool,
     ) -> Result<(), SnapshotError> {
         let update = self
-            .get_updated_tree_value(&path, disk_path, maybe_current_file_state, &new_file_state)
+            .get_updated_tree_value(
+                &path,
+                disk_path,
+                maybe_current_file_state,
+                &new_file_state,
+                force_resnapshot,
+            )
             .await?;
         // Preserve materialized conflict data for normal, non-resolved files
         if matches!(new_file_state.file_type, FileType::Normal { .. })
@@ -2312,19 +2334,21 @@ impl FileSnapshotter<'_> {
         disk_path: &Path,
         maybe_current_file_state: Option<&FileState>,
         new_file_state: &FileState,
+        force_resnapshot: bool,
     ) -> Result<Option<MergedTreeValue>, SnapshotError> {
-        let clean = match maybe_current_file_state {
-            None => {
-                // untracked
-                false
-            }
-            Some(current_file_state) => {
-                // If the file's mtime was set at the same time as this state file's own mtime,
-                // then we don't know if the file was modified before or after this state file.
-                new_file_state.is_clean(current_file_state)
-                    && current_file_state.mtime < self.tree_state.own_mtime
-            }
-        };
+        let clean = !force_resnapshot
+            && match maybe_current_file_state {
+                None => {
+                    // untracked
+                    false
+                }
+                Some(current_file_state) => {
+                    // If the file's mtime was set at the same time as this state file's own mtime,
+                    // then we don't know if the file was modified before or after this state file.
+                    new_file_state.is_clean(current_file_state)
+                        && current_file_state.mtime < self.tree_state.own_mtime
+                }
+            };
         if clean {
             Ok(None)
         } else {
@@ -3354,6 +3378,26 @@ impl TreeState {
     }
 }
 
+fn gitattributes_contents_equal(disk_contents: &[u8], current_contents: Option<&[u8]>) -> bool {
+    let Some(current_contents) = current_contents else {
+        return false;
+    };
+    normalize_crlf(disk_contents) == normalize_crlf(current_contents)
+}
+
+fn normalize_crlf(contents: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut index = 0;
+    while index < contents.len() {
+        if contents[index] == b'\r' && contents.get(index + 1) == Some(&b'\n') {
+            index += 1;
+        }
+        normalized.push(contents[index]);
+        index += 1;
+    }
+    normalized
+}
+
 fn checkout_error_for_stat_error(err: io::Error, path: &Path) -> CheckoutError {
     CheckoutError::Other {
         message: format!("Failed to stat file {}", path.display()),
@@ -3984,5 +4028,18 @@ mod tests {
             // i64::MIN could be returned, but we don't care such old timestamp
             assert_eq!(system_time_to_millis(time), None);
         }
+    }
+
+    #[test]
+    fn test_gitattributes_crlf_matches_lf() {
+        assert!(gitattributes_contents_equal(
+            b"*.bin filter=lfs\r\n",
+            Some(b"*.bin filter=lfs\n"),
+        ));
+        assert!(!gitattributes_contents_equal(
+            b"*.bin filter=lfs\r\n",
+            Some(b"*.txt filter=lfs\n"),
+        ));
+        assert!(!gitattributes_contents_equal(b"*.bin filter=lfs\r\n", None));
     }
 }
