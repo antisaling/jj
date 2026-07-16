@@ -173,6 +173,73 @@ fn test_workspace_add_fetches_lfs_objects_then_runs_checkout_when_objects_are_mi
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_workspace_update_stale_recovers_interrupted_lfs_checkout() {
+    let mut test_env = TestEnvironment::default();
+    set_up_fake_git_lfs(&mut test_env);
+    test_env.add_config(r#"git.ignore-filters = ["lfs"]"#);
+    test_env.add_env_var("FAKE_GIT_LFS_REQUIRE_GIT_DIR", "1");
+    let ready_path = test_env.env_root().join("lfs-checkout-ready");
+    let release_path = test_env.env_root().join("lfs-checkout-release");
+    let done_path = test_env.env_root().join("lfs-checkout-done");
+    test_env.add_env_var("FAKE_GIT_LFS_BLOCK_SUBCOMMAND", "checkout");
+    test_env.add_env_var("FAKE_GIT_LFS_CANCEL_PARENT", "1");
+    test_env.add_env_var("FAKE_GIT_LFS_READY_FILE", &ready_path);
+    test_env.add_env_var("FAKE_GIT_LFS_RELEASE_FILE", &release_path);
+    test_env.add_env_var("FAKE_GIT_LFS_DONE_FILE", &done_path);
+    test_env.run_jj_in(".", ["git", "init", "ws1"]).success();
+    let ws1_dir = test_env.work_dir("ws1");
+    ws1_dir.write_file(".gitattributes", "*.bin filter=lfs\n");
+    ws1_dir.write_file("asset.bin", "asset contents\n");
+    ws1_dir.run_jj(["commit", "-m", "seed"]).success();
+
+    let output = ws1_dir.run_jj(["workspace", "add", "../ws2"]);
+    assert!(
+        !output.status.success(),
+        "expected LFS checkout cancellation"
+    );
+    assert!(
+        ready_path.exists(),
+        "workspace add did not reach LFS checkout"
+    );
+    std::fs::write(&release_path, "").unwrap();
+    let lfs_exited = (0..200).any(|_| {
+        if done_path.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(lfs_exited, "fake git-lfs did not exit after release");
+    test_env.add_env_var("FAKE_GIT_LFS_CANCEL_PARENT", "0");
+
+    let ws2_dir = test_env.work_dir("ws2");
+    let pointer_bytes = std::fs::read(ws2_dir.root().join("asset.bin")).unwrap();
+    assert!(
+        pointer_bytes.starts_with(b"version https://git-lfs.github.com/spec"),
+        "interrupted workspace should retain the LFS pointer before recovery"
+    );
+
+    let output = ws2_dir.run_jj(["workspace", "update-stale"]);
+    assert!(
+        output.status.success(),
+        "workspace update-stale failed: {:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        output.stdout.raw(),
+        output.stderr.raw()
+    );
+    let hydrated_bytes = std::fs::read(ws2_dir.root().join("asset.bin")).unwrap();
+    assert_eq!(
+        hydrated_bytes,
+        vec![b'X'; "asset contents\n".len()],
+        "update-stale output:\nstdout: {}\nstderr: {}",
+        output.stdout.raw(),
+        output.stderr.raw()
+    );
+}
+
 #[test]
 fn test_workspaces_add_with_message() {
     let test_env = TestEnvironment::default();
