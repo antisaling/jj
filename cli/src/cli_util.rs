@@ -612,6 +612,7 @@ impl CommandHelper {
                     locked_ws.locked_wc(),
                     &desired_wc_commit,
                     &repo,
+                    true,
                 )
                 .await?
                 {
@@ -2828,7 +2829,7 @@ async fn handle_stale_working_copy(
         return Ok(None);
     };
     let old_op_id = locked_wc.old_operation_id().clone();
-    match WorkingCopyFreshness::check_stale(locked_wc, &wc_commit, &repo).await {
+    match WorkingCopyFreshness::check_stale(locked_wc, &wc_commit, &repo, false).await {
         Ok(WorkingCopyFreshness::Fresh) => Ok(Some((repo, wc_commit))),
         Ok(WorkingCopyFreshness::Updated(wc_operation)) => {
             let repo = repo
@@ -2894,6 +2895,17 @@ async fn update_stale_working_copy(
         != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
     {
         return Err(user_error("Concurrent working copy operation. Try again."));
+    }
+    // A checkout interrupted after materializing an LFS pointer can leave the
+    // pointer on disk while the working-copy tree already matches the target.
+    // Reset the state first so check_out() retries materialization instead of
+    // treating the unchanged tree as a no-op.
+    if stale_commit.tree().tree_ids_and_labels() == new_commit.tree().tree_ids_and_labels() {
+        locked_ws
+            .locked_wc()
+            .recover(new_commit)
+            .await
+            .map_err(|err| internal_error_with_message("Failed to recover working copy", err))?;
     }
     let stats = locked_ws
         .locked_wc()

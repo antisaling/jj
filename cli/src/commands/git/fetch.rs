@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use std::io;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
 
 use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
@@ -27,6 +30,7 @@ use jj_lib::git::IgnoredRefspecs;
 use jj_lib::git::expand_fetch_refspecs;
 use jj_lib::git::get_git_backend;
 use jj_lib::git::load_default_fetch_bookmarks;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::RefName;
 use jj_lib::ref_name::RemoteName;
 use jj_lib::repo::Repo as _;
@@ -38,6 +42,7 @@ use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::commands::git::get_single_remote;
+use crate::commands::git::lfs_transfers_enabled;
 use crate::complete;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::load_git_import_options;
@@ -135,6 +140,8 @@ pub async fn cmd_git_fetch(
     args: &GitFetchArgs,
 ) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui).await?;
+    let wc_root = workspace_command.workspace_root().to_owned();
+    let wc_commit_id = workspace_command.get_wc_commit_id().map(|id| id.hex());
     let remote_expr = if args.all_remotes {
         StringExpression::all()
     } else if let Some(remotes) = &args.remotes {
@@ -230,6 +237,16 @@ pub async fn cmd_git_fetch(
     }
 
     let git_settings = GitSettings::from_settings(tx.settings())?;
+    let lfs_git_context = lfs_transfers_enabled(tx.settings())?
+        .then(|| {
+            let git_backend = get_git_backend(tx.repo().store())?;
+            let git_worktree = git_backend
+                .git_workdir()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| wc_root.clone());
+            Ok::<_, CommandError>((git_backend.git_repo_path().to_owned(), git_worktree))
+        })
+        .transpose()?;
     let import_options = load_git_import_options(ui, &git_settings, &remote_settings)?;
     let mut git_fetch = GitFetch::new(
         tx.repo_mut(),
@@ -246,6 +263,43 @@ pub async fn cmd_git_fetch(
     }
 
     let import_stats = git_fetch.import_refs().await?;
+    let mut lfs_fetch_refs = Vec::new();
+    for (symbol, (_old_target, target)) in &import_stats.changed_remote_bookmarks {
+        if target.is_present()
+            && tx
+                .repo()
+                .view()
+                .get_remote_bookmark(symbol.as_ref())
+                .is_tracked()
+        {
+            lfs_fetch_refs.push((
+                symbol.remote.as_str().to_owned(),
+                format!(
+                    "refs/remotes/{}/{}",
+                    symbol.remote.as_str(),
+                    symbol.name.as_str()
+                ),
+            ));
+        }
+    }
+    for (symbol, (_old_target, target)) in &import_stats.changed_remote_tags {
+        if target.is_present()
+            && tx
+                .repo()
+                .view()
+                .get_remote_tag(symbol.as_ref())
+                .is_tracked()
+        {
+            lfs_fetch_refs.push((
+                symbol.remote.as_str().to_owned(),
+                format!(
+                    "refs/jj/remote-tags/{}/{}",
+                    symbol.remote.as_str(),
+                    symbol.name.as_str()
+                ),
+            ));
+        }
+    }
     print_git_import_stats(ui, &tx, &import_stats)?;
 
     if let Some(bookmark_expr) = &common_bookmark_expr {
@@ -260,10 +314,135 @@ pub async fn cmd_git_fetch(
         ),
     )
     .await?;
+
+    // LFS runs after the transaction is committed so cancellation doesn't
+    // leave jj in a stale state (git refs are already persisted by this point).
+    if let Some((git_dir, git_worktree)) = lfs_git_context {
+        let missing_local_lfs_objects = if lfs_fetch_refs.is_empty() {
+            match has_missing_local_lfs_objects(&git_dir, &git_worktree) {
+                Ok(missing) => missing,
+                Err(message) => {
+                    writeln!(
+                        ui.warning_default(),
+                        "{message}; running LFS transfers anyway."
+                    )?;
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        if !lfs_fetch_refs.is_empty() || missing_local_lfs_objects {
+            for remote in &matching_remotes {
+                let refs: Vec<&str> = lfs_fetch_refs
+                    .iter()
+                    .filter(|(ref_remote, _ref_name)| ref_remote == remote.as_str())
+                    .map(|(_ref_remote, ref_name)| ref_name.as_str())
+                    .collect();
+                if refs.is_empty() && !missing_local_lfs_objects {
+                    continue;
+                }
+                let mut args = vec!["fetch", remote.as_str()];
+                if refs.is_empty() {
+                    let Some(wc_commit_id) = wc_commit_id.as_deref() else {
+                        continue;
+                    };
+                    args.push(wc_commit_id);
+                } else {
+                    args.extend(refs);
+                }
+                run_optional_git_lfs_command(ui, &git_dir, &git_worktree, &args)?;
+            }
+            run_optional_git_lfs_command(ui, &git_dir, &git_worktree, &["checkout"])?;
+        }
+    }
+
     Ok(())
 }
 
 const DEFAULT_REMOTE: &RemoteName = RemoteName::new("origin");
+
+fn git_config_string(git_dir: &Path, git_worktree: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", git_worktree)
+        .current_dir(git_worktree)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn run_optional_git_lfs_command(
+    ui: &mut Ui,
+    git_dir: &Path,
+    git_worktree: &Path,
+    args: &[&str],
+) -> io::Result<()> {
+    let command_name = format!("git-lfs {}", args.join(" "));
+    writeln!(ui.status(), "Running `{command_name}`")?;
+    let status = std::process::Command::new("git-lfs")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", git_worktree)
+        .current_dir(git_worktree)
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            writeln!(
+                ui.warning_default(),
+                "`{command_name}` failed with {status}; continuing."
+            )?;
+        }
+        Err(err) => {
+            writeln!(
+                ui.warning_default(),
+                "Failed to execute `{command_name}`: {err}; continuing."
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn has_missing_local_lfs_objects(git_dir: &Path, git_worktree: &Path) -> Result<bool, String> {
+    let mut command = std::process::Command::new("git-lfs");
+    command
+        .args(["ls-files", "--long"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", git_worktree)
+        .current_dir(git_worktree);
+    if let Some(include) = git_config_string(git_dir, git_worktree, "lfs.fetchinclude") {
+        command.arg(format!("--include={include}"));
+    }
+    if let Some(exclude) = git_config_string(git_dir, git_worktree, "lfs.fetchexclude") {
+        command.arg(format!("--exclude={exclude}"));
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to execute `git-lfs ls-files --long`: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git-lfs ls-files --long` failed with {}",
+            output.status
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some("-")))
+}
 
 fn get_default_fetch_remotes(
     ui: &Ui,

@@ -27,8 +27,10 @@ use std::io::Write as _;
 use clap::Subcommand;
 use clap::ValueEnum;
 use jj_lib::config::ConfigFile;
+use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
+use jj_lib::config::StackedConfig;
 use jj_lib::git;
 use jj_lib::git::UnexpectedGitBackendError;
 use jj_lib::ref_name::RemoteName;
@@ -36,6 +38,7 @@ use jj_lib::ref_name::RemoteNameBuf;
 use jj_lib::ref_name::RemoteRefSymbol;
 use jj_lib::ref_name::RemoteRefSymbolBuf;
 use jj_lib::revset;
+use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 
 use self::clone::GitCloneArgs;
@@ -106,6 +109,25 @@ pub async fn cmd_git(
         GitCommand::Remote(args) => cmd_git_remote(ui, command, args).await,
         GitCommand::Root(args) => cmd_git_root(ui, command, args).await,
     }
+}
+
+pub fn lfs_transfers_enabled(settings: &UserSettings) -> Result<bool, CommandError> {
+    // Use only non-default layers so transfer-side LFS behavior is opt-in.
+    let mut non_default_config = StackedConfig::empty();
+    for source in [
+        ConfigSource::EnvBase,
+        ConfigSource::User,
+        ConfigSource::Repo,
+        ConfigSource::Workspace,
+        ConfigSource::EnvOverrides,
+        ConfigSource::CommandArg,
+    ] {
+        non_default_config.extend_layers(settings.config().layers_for(source).iter().cloned());
+    }
+    let filters = non_default_config
+        .get::<Vec<String>>("git.ignore-filters")
+        .optional()?;
+    Ok(filters.is_some_and(|filters| filters.iter().any(|filter| filter == "lfs")))
 }
 
 pub fn maybe_add_gitignore(workspace_command: &WorkspaceCommandHelper) -> Result<(), CommandError> {

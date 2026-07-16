@@ -39,6 +39,27 @@ pub fn fake_diff_editor_path() -> String {
     path.as_os_str().to_str().unwrap().to_owned()
 }
 
+pub fn fake_git_lfs_path() -> String {
+    let path = assert_cmd::cargo::cargo_bin!("git-lfs");
+    assert!(path.is_file());
+    path.as_os_str().to_str().unwrap().to_owned()
+}
+
+pub fn set_up_fake_git_lfs(test_env: &mut TestEnvironment) -> std::path::PathBuf {
+    let fake_git_lfs = std::path::PathBuf::from(fake_git_lfs_path());
+    let fake_bin_dir = fake_git_lfs.parent().unwrap().to_owned();
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin_dir).chain(std::env::split_paths(&existing_path)),
+    )
+    .unwrap();
+    test_env.add_env_var("PATH", &path);
+    let log_path = test_env.env_root().join("fake_git_lfs.log");
+    std::fs::write(&log_path, "").unwrap();
+    test_env.add_env_var("FAKE_GIT_LFS_LOG", &log_path);
+    log_path
+}
+
 /// Forcibly enable interactive prompt.
 pub fn force_interactive(cmd: &mut assert_cmd::Command) -> &mut assert_cmd::Command {
     cmd.env("JJ_INTERACTIVE", "1")
