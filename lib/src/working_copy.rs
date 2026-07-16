@@ -133,6 +133,12 @@ pub trait LockedWorkingCopy: Any + Send {
     /// without assuming that the previous tree exists.
     async fn recover(&mut self, commit: &Commit) -> Result<(), ResetError>;
 
+    /// Whether the working copy contains an LFS pointer that should be
+    /// materialized.
+    fn has_unmaterialized_lfs_files(&self) -> bool {
+        false
+    }
+
     /// See `WorkingCopy::sparse_patterns()`
     fn sparse_patterns(&self) -> Result<&[RepoPathBuf], WorkingCopyStateError>;
 
@@ -367,6 +373,7 @@ impl WorkingCopyFreshness {
         locked_wc: &dyn LockedWorkingCopy,
         wc_commit: &Commit,
         repo: &ReadonlyRepo,
+        check_for_unmaterialized_lfs_files: bool,
     ) -> Result<Self, OpStoreError> {
         // Check if the working copy's operation matches the repo's operation
         if locked_wc.old_operation_id() == repo.op_id() {
@@ -393,8 +400,14 @@ impl WorkingCopyFreshness {
                 if locked_wc.old_tree().tree_ids_and_labels()
                     == wc_commit.tree().tree_ids_and_labels()
                 {
-                    // The working copy doesn't require any changes
-                    Ok(Self::Fresh)
+                    if check_for_unmaterialized_lfs_files
+                        && locked_wc.has_unmaterialized_lfs_files()
+                    {
+                        Ok(Self::WorkingCopyStale)
+                    } else {
+                        // The working copy doesn't require any changes
+                        Ok(Self::Fresh)
+                    }
                 } else {
                     Ok(Self::WorkingCopyStale)
                 }

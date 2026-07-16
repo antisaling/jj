@@ -2841,10 +2841,44 @@ impl TreeState {
     pub fn check_out(&mut self, new_tree: &MergedTree) -> Result<CheckoutStats, CheckoutError> {
         let old_tree = self.tree.clone();
         let stats = self
-            .update(&old_tree, new_tree, self.sparse_matcher().as_ref())
+            .update(&old_tree, new_tree, self.sparse_matcher().as_ref(), false)
             .block_on()?;
         self.tree = new_tree.clone();
         Ok(stats)
+    }
+
+    fn force_check_out(&mut self, new_tree: &MergedTree) -> Result<CheckoutStats, CheckoutError> {
+        let lfs_pointer_paths = self.lfs_pointer_paths()?;
+        if lfs_pointer_paths.is_empty() {
+            return Ok(CheckoutStats::default());
+        }
+        let matcher = FilesMatcher::new(lfs_pointer_paths);
+        let empty_tree = self.store.empty_merged_tree();
+        let stats = self
+            .update(&empty_tree, new_tree, &matcher, true)
+            .block_on()?;
+        self.tree = new_tree.clone();
+        Ok(stats)
+    }
+
+    fn lfs_pointer_paths(&self) -> Result<Vec<RepoPathBuf>, CheckoutError> {
+        if !self.ignore_filters.contains("lfs") {
+            return Ok(Vec::new());
+        }
+        let paths = self
+            .file_states()
+            .iter()
+            .filter_map(|(path, state)| {
+                if !matches!(state.file_type, FileType::Normal { .. }) {
+                    return None;
+                }
+                let disk_path = path.to_fs_path(&self.working_copy_path).ok()?;
+                self.disk_file_starts_with_lfs_pointer(&disk_path)
+                    .ok()
+                    .and_then(|is_pointer| is_pointer.then(|| path.to_owned()))
+            })
+            .collect();
+        Ok(paths)
     }
 
     pub fn set_sparse_patterns(
@@ -2857,9 +2891,11 @@ impl TreeState {
         let added_matcher = DifferenceMatcher::new(&new_matcher, &old_matcher);
         let removed_matcher = DifferenceMatcher::new(&old_matcher, &new_matcher);
         let empty_tree = self.store.empty_merged_tree();
-        let added_stats = self.update(&empty_tree, &tree, &added_matcher).block_on()?;
+        let added_stats = self
+            .update(&empty_tree, &tree, &added_matcher, false)
+            .block_on()?;
         let removed_stats = self
-            .update(&tree, &empty_tree, &removed_matcher)
+            .update(&tree, &empty_tree, &removed_matcher, false)
             .block_on()?;
         self.sparse_patterns = sparse_patterns;
         assert_eq!(added_stats.updated_files, 0);
@@ -2880,6 +2916,7 @@ impl TreeState {
         old_tree: &MergedTree,
         new_tree: &MergedTree,
         matcher: &dyn Matcher,
+        overwrite_existing_files: bool,
     ) -> Result<CheckoutStats, CheckoutError> {
         struct PendingLfsHydration {
             path: RepoPathBuf,
@@ -2981,12 +3018,16 @@ impl TreeState {
             };
 
             // If the path was present, check reserved path first and delete it.
-            let present_file_deleted = before.is_present()
-                && if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_))) {
-                    remove_old_submodule_dir(&disk_path)?
-                } else {
-                    remove_old_file(&disk_path)?
-                };
+            let present_file_deleted = if overwrite_existing_files {
+                remove_old_file(&disk_path)?
+            } else {
+                before.is_present()
+                    && if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+                        remove_old_submodule_dir(&disk_path)?
+                    } else {
+                        remove_old_file(&disk_path)?
+                    }
+            };
 
             // If not, create temporary file to test the path validity.
             if !present_file_deleted && !can_create_new_file(&disk_path)? {
@@ -3004,7 +3045,7 @@ impl TreeState {
                     // otherwise be lost.
                     // Falling through to the "after" state code in case there
                     // are parents to be deleted.
-                } else {
+                } else if !overwrite_existing_files {
                     changed_file_states.push((path, FileState::placeholder()));
                     stats.skipped_files += 1;
                     return Ok(());
@@ -3495,6 +3536,7 @@ impl WorkingCopy for LocalWorkingCopy {
             old_operation_id,
             old_tree,
             tree_state_dirty: false,
+            force_checkout: false,
             new_workspace_name: None,
             _lock: lock,
         }))
@@ -3672,6 +3714,7 @@ pub struct LockedLocalWorkingCopy {
     old_operation_id: OperationId,
     old_tree: MergedTree,
     tree_state_dirty: bool,
+    force_checkout: bool,
     new_workspace_name: Option<WorkspaceNameBuf>,
     _lock: FileLock,
 }
@@ -3701,7 +3744,12 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         // continue an interrupted update if we find such a file.
         let new_tree = commit.tree();
         let tree_state = self.wc.tree_state_mut()?;
-        if tree_state.tree.tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
+        if self.force_checkout {
+            self.force_checkout = false;
+            let stats = tree_state.force_check_out(&new_tree)?;
+            self.tree_state_dirty = true;
+            Ok(stats)
+        } else if tree_state.tree.tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
             let stats = tree_state.check_out(&new_tree)?;
             self.tree_state_dirty = true;
             Ok(stats)
@@ -3725,7 +3773,29 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         let new_tree = commit.tree();
         self.wc.tree_state_mut()?.recover(&new_tree).await?;
         self.tree_state_dirty = true;
+        self.force_checkout = true;
         Ok(())
+    }
+
+    fn has_unmaterialized_lfs_files(&self) -> bool {
+        let Ok(tree_state) = self.wc.tree_state() else {
+            return false;
+        };
+        if !tree_state.ignore_filters.contains("lfs") {
+            return false;
+        }
+        tree_state.file_states().iter().any(|(path, state)| {
+            if !matches!(state.file_type, FileType::Normal { .. }) {
+                return false;
+            }
+            let Ok(disk_path) = path.to_fs_path(&tree_state.working_copy_path) else {
+                return false;
+            };
+            tree_state
+                .disk_file_starts_with_lfs_pointer(&disk_path)
+                .ok()
+                .unwrap_or(false)
+        })
     }
 
     fn sparse_patterns(&self) -> Result<&[RepoPathBuf], WorkingCopyStateError> {
