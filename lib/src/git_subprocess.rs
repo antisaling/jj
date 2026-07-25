@@ -14,6 +14,7 @@
 
 use std::io;
 use std::io::BufReader;
+use std::io::IsTerminal as _;
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -82,6 +83,18 @@ pub(crate) struct GitSubprocessContext {
     options: GitSubprocessOptions,
 }
 
+fn should_inherit_stdin(stdin_is_terminal: bool) -> bool {
+    cfg!(windows) && stdin_is_terminal
+}
+
+fn should_use_interactive_terminal() -> bool {
+    should_use_interactive_terminal_for(io::stdin().is_terminal(), io::stderr().is_terminal())
+}
+
+fn should_use_interactive_terminal_for(stdin_is_terminal: bool, stderr_is_terminal: bool) -> bool {
+    should_inherit_stdin(stdin_is_terminal) && stderr_is_terminal
+}
+
 impl GitSubprocessContext {
     pub(crate) fn new(git_dir: impl Into<PathBuf>, options: GitSubprocessOptions) -> Self {
         Self {
@@ -100,9 +113,10 @@ impl GitSubprocessContext {
     /// Create the Git command
     fn create_command(&self) -> Command {
         let mut git_cmd = Command::new(&self.options.executable_path);
+        let interactive_terminal = should_use_interactive_terminal();
         // Hide console window on Windows (https://stackoverflow.com/a/60958956)
         #[cfg(windows)]
-        {
+        if !interactive_terminal {
             use std::os::windows::process::CommandExt as _;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             git_cmd.creation_flags(CREATE_NO_WINDOW);
@@ -136,8 +150,22 @@ impl GitSubprocessContext {
             .env_remove("LC_ALL")
             .env_remove("LANGUAGE")
             .env("LC_MESSAGES", "C")
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped());
+            // OpenSSH on Windows needs the parent's console to prompt for a
+            // password. Git still creates its own pipes for the transport, so
+            // inheriting stdin here does not change Git protocol I/O.
+            .stdin(if interactive_terminal {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            // OpenSSH also checks stderr for a terminal before prompting. In
+            // interactive mode Git output is written directly to the terminal;
+            // otherwise keep stderr piped so jj can parse it.
+            .stderr(if interactive_terminal {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            });
 
         git_cmd.envs(&self.options.environment);
 
@@ -795,13 +823,16 @@ fn wait_with_progress(
     let (stdout, stderr) = thread::scope(|s| -> io::Result<_> {
         drop(child.stdin.take());
         let mut child_stdout = child.stdout.take().expect("stdout should be piped");
-        let mut child_stderr = child.stderr.take().expect("stderr should be piped");
         let thread = s.spawn(move || -> io::Result<_> {
             let mut buf = Vec::new();
             child_stdout.read_to_end(&mut buf)?;
             Ok(buf)
         });
-        let stderr = read_to_end_with_progress(&mut child_stderr, callback)?;
+        let stderr = if let Some(mut child_stderr) = child.stderr.take() {
+            read_to_end_with_progress(&mut child_stderr, callback)?
+        } else {
+            Vec::new()
+        };
         let stdout = thread.join().expect("reader thread wouldn't panic")?;
         Ok((stdout, stderr))
     })
@@ -1003,6 +1034,18 @@ and the repository exists. "###;
 !\tdeadbeef:refs/heads/bookmark9\t[remote rejected]
 Done";
     const SAMPLE_OK_STDERR: &[u8] = b"";
+
+    #[test]
+    fn test_should_inherit_stdin() {
+        assert!(!should_inherit_stdin(false));
+        assert_eq!(should_inherit_stdin(true), cfg!(windows));
+        assert!(!should_use_interactive_terminal_for(false, true));
+        assert!(!should_use_interactive_terminal_for(true, false));
+        assert_eq!(
+            should_use_interactive_terminal_for(true, true),
+            cfg!(windows)
+        );
+    }
 
     #[derive(Debug, Default)]
     struct GitSubprocessCapture {
