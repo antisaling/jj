@@ -31,8 +31,6 @@ use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -207,8 +205,10 @@ pub struct GitBackend {
 }
 
 struct GitReadRepoPool {
+    // Slot 0 is for calls made outside Rayon. The remaining slots correspond
+    // one-to-one with Rayon worker indexes, so concurrent readers don't fight
+    // over a round-robin repository mutex.
     repos: Vec<Mutex<gix::Repository>>,
-    next: AtomicUsize,
 }
 
 struct GitWriteRepoPool {
@@ -261,7 +261,7 @@ fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>>
 
 impl GitReadRepoPool {
     fn new(base_repo: &gix::ThreadSafeRepository, object_cache_size: Option<usize>) -> Self {
-        let repos = (0..GIT_TREE_READ_CONCURRENCY)
+        let repos = (0..rayon::current_num_threads().max(1) + 1)
             .map(|_| {
                 let mut repo = base_repo.to_thread_local();
                 repo.objects.refresh_never();
@@ -271,14 +271,11 @@ impl GitReadRepoPool {
                 Mutex::new(repo)
             })
             .collect();
-        Self {
-            repos,
-            next: AtomicUsize::new(0),
-        }
+        Self { repos }
     }
 
     fn with_repo<T>(&self, f: impl FnOnce(&mut gix::Repository) -> T) -> T {
-        let index = self.next.fetch_add(1, AtomicOrdering::Relaxed) % self.repos.len();
+        let index = rayon::current_thread_index().map_or(0, |index| index + 1);
         let mut repo = self.repos[index].lock().unwrap();
         f(&mut repo)
     }
