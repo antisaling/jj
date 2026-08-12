@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -209,6 +210,47 @@ struct GitReadRepoPool {
     next: AtomicUsize,
 }
 
+struct GitTreeEntry<'a> {
+    name: &'a [u8],
+    mode: &'static [u8],
+    oid: &'a [u8],
+    is_tree: bool,
+}
+
+fn git_tree_entry_cmp(a: &GitTreeEntry<'_>, b: &GitTreeEntry<'_>) -> Ordering {
+    let common = a.name.len().min(b.name.len());
+    a.name[..common].cmp(&b.name[..common]).then_with(|| {
+        let a = a.name.get(common).or_else(|| a.is_tree.then_some(&b'/'));
+        let b = b.name.get(common).or_else(|| b.is_tree.then_some(&b'/'));
+        a.cmp(&b)
+    })
+}
+
+fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>> {
+    if !entries.is_sorted_by(|a, b| git_tree_entry_cmp(a, b) != Ordering::Greater) {
+        entries.sort_unstable_by(git_tree_entry_cmp);
+    }
+    let size = entries
+        .iter()
+        .map(|entry| entry.mode.len() + 1 + entry.name.len() + 1 + entry.oid.len())
+        .sum();
+    let mut bytes = Vec::with_capacity(size);
+    for entry in entries {
+        if entry.name.contains(&0) {
+            return Err(gix::objs::tree::write::Error::NullbyteInFilename {
+                name: BString::from(entry.name),
+            }
+            .into());
+        }
+        bytes.extend_from_slice(entry.mode);
+        bytes.push(b' ');
+        bytes.extend_from_slice(entry.name);
+        bytes.push(0);
+        bytes.extend_from_slice(entry.oid);
+    }
+    Ok(bytes)
+}
+
 impl GitReadRepoPool {
     fn new(base_repo: &gix::ThreadSafeRepository) -> Self {
         let repos = (0..GIT_TREE_READ_CONCURRENCY)
@@ -226,7 +268,7 @@ impl GitReadRepoPool {
     }
 
     fn with_repo<T>(&self, f: impl FnOnce(&mut gix::Repository) -> T) -> T {
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.repos.len();
+        let index = self.next.fetch_add(1, AtomicOrdering::Relaxed) % self.repos.len();
         let mut repo = self.repos[index].lock().unwrap();
         f(&mut repo)
     }
@@ -1519,59 +1561,57 @@ impl Backend for GitBackend {
     }
 
     async fn write_tree(&self, _path: &RepoPath, contents: &Tree) -> BackendResult<TreeId> {
-        // Tree entries to be written must be sorted by Entry::filename(), which
-        // is slightly different from the order of our backend::Tree.
         let entries = contents
             .entries()
             .map(|entry| {
-                let filename = BString::from(entry.name().as_internal_str());
                 match entry.value() {
                     TreeValue::File {
                         id,
                         executable: false,
                         copy_id: _, // TODO: Use the value
-                    } => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Blob.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
+                    } => GitTreeEntry {
+                        name: entry.name().as_internal_str().as_bytes(),
+                        mode: b"100644",
+                        oid: id.as_bytes(),
+                        is_tree: false,
                     },
                     TreeValue::File {
                         id,
                         executable: true,
                         copy_id: _, // TODO: Use the value
-                    } => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::BlobExecutable.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
+                    } => GitTreeEntry {
+                        name: entry.name().as_internal_str().as_bytes(),
+                        mode: b"100755",
+                        oid: id.as_bytes(),
+                        is_tree: false,
                     },
-                    TreeValue::Symlink(id) => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Link.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
+                    TreeValue::Symlink(id) => GitTreeEntry {
+                        name: entry.name().as_internal_str().as_bytes(),
+                        mode: b"120000",
+                        oid: id.as_bytes(),
+                        is_tree: false,
                     },
-                    TreeValue::Tree(id) => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Tree.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
+                    TreeValue::Tree(id) => GitTreeEntry {
+                        name: entry.name().as_internal_str().as_bytes(),
+                        mode: b"40000",
+                        oid: id.as_bytes(),
+                        is_tree: true,
                     },
-                    TreeValue::GitSubmodule(id) => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Commit.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
+                    TreeValue::GitSubmodule(id) => GitTreeEntry {
+                        name: entry.name().as_internal_str().as_bytes(),
+                        mode: b"160000",
+                        oid: id.as_bytes(),
+                        is_tree: false,
                     },
                 }
             })
-            .sorted_unstable()
             .collect();
         // Serialize and hash outside the repository lock. gix's `write_object()` does both
         // while holding the lock and hashes the serialized object again before writing it.
-        let tree = gix::objs::Tree { entries };
-        let mut bytes = Vec::with_capacity(tree.size() as usize);
-        tree.write_to(&mut bytes)
-            .map_err(|err| BackendError::WriteObject {
-                object_type: "tree",
-                source: Box::new(err),
-            })?;
+        let bytes = serialize_git_tree(entries).map_err(|err| BackendError::WriteObject {
+            object_type: "tree",
+            source: Box::new(err),
+        })?;
         let oid = gix::objs::compute_hash(
             self.base_repo.objects.object_hash(),
             gix::objs::Kind::Tree,
@@ -1998,6 +2038,32 @@ mod tests {
         gix::open::Options::isolated()
             .config_overrides(git_config())
             .strict_config(true)
+    }
+
+    #[test]
+    fn serialize_git_tree_uses_git_sort_order() -> TestResult {
+        const SHA1_LENGTH: usize = 20;
+        let entries = vec![
+            GitTreeEntry {
+                name: b"foo",
+                mode: b"40000",
+                oid: &[1; SHA1_LENGTH],
+                is_tree: true,
+            },
+            GitTreeEntry {
+                name: b"foo.bar",
+                mode: b"100644",
+                oid: &[2; SHA1_LENGTH],
+                is_tree: false,
+            },
+        ];
+        let bytes = serialize_git_tree(entries)?;
+        let mut expected = b"100644 foo.bar\0".to_vec();
+        expected.extend_from_slice(&[2; SHA1_LENGTH]);
+        expected.extend_from_slice(b"40000 foo\0");
+        expected.extend_from_slice(&[1; SHA1_LENGTH]);
+        assert_eq!(bytes, expected);
+        Ok(())
     }
 
     fn git_init(directory: impl AsRef<Path>, object_hash: gix::hash::Kind) -> gix::Repository {
