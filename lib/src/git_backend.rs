@@ -1530,13 +1530,11 @@ fn write_or_buffer_object_on_pool(
     object_type: &'static str,
 ) -> BackendResult<()> {
     written_objects.write_once(oid, || {
-        // Packed objects are intentionally not checked here; finding those would
-        // require an ODB lookup. Avoid recompressing an existing loose object.
-        if loose_object_path(objects_dir, &oid).is_file() {
-            return Ok(());
-        }
         let batch_active = write_batch_state.lock().unwrap().batch.is_some();
         if batch_active {
+            // Rebase writes create huge numbers of objects. Don't stat the loose
+            // object path for each one: buffering an existing object again is
+            // harmless, and the command-scoped pack makes it durable in bulk.
             if buffered_objects.lock().unwrap().contains_key(&oid) {
                 return Ok(());
             }
@@ -1556,6 +1554,13 @@ fn write_or_buffer_object_on_pool(
                     oid,
                 );
             }
+        }
+
+        // Packed objects are intentionally not checked here; finding those would
+        // require an ODB lookup. Avoid rewriting an existing loose object when
+        // there is no active batch to absorb it cheaply.
+        if loose_object_path(objects_dir, &oid).is_file() {
+            return Ok(());
         }
 
         write_repos
@@ -3427,6 +3432,42 @@ mod tests {
                 .block_on()?,
             "buffered-target"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn active_write_batch_buffers_existing_loose_object() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path);
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+        let contents = b"already loose";
+        let file_id = backend
+            .write_file_bytes(RepoPath::root(), contents)
+            .block_on()?;
+        let file_oid = validate_git_object_id(&file_id)?;
+        assert!(loose_object_path(&backend.objects_dir, &file_oid).exists());
+        drop(backend);
+
+        // A fresh backend has no in-memory knowledge of the loose object. Active
+        // batches should still buffer it without probing the filesystem first.
+        let backend = GitBackend::load(&settings, &store_path)?;
+        let write_batch = backend.start_write_batch();
+        let duplicate_id = backend
+            .write_file_bytes(RepoPath::root(), contents)
+            .block_on()?;
+        assert_eq!(duplicate_id, file_id);
+        assert!(
+            backend
+                .buffered_objects
+                .lock()
+                .unwrap()
+                .contains_key(&file_oid)
+        );
+        write_batch.finish()?;
         Ok(())
     }
 
