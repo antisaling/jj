@@ -79,6 +79,10 @@ use jj_lib::fileset::FilesetAliasesMap;
 use jj_lib::fileset::FilesetDiagnostics;
 use jj_lib::fileset::FilesetExpression;
 use jj_lib::fileset::FilesetParseContext;
+#[cfg(feature = "git")]
+use jj_lib::git_backend::GitBackend;
+#[cfg(feature = "git")]
+use jj_lib::git_backend::GitWriteBatchGuard;
 use jj_lib::gitignore::GitIgnoreError;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::id_prefix::IdPrefixContext;
@@ -1242,6 +1246,8 @@ pub struct WorkspaceCommandHelper {
     op_summary_template_text: String,
     may_snapshot_working_copy: bool,
     may_update_working_copy: bool,
+    #[cfg(feature = "git")]
+    _git_write_batch: Option<GitWriteBatchGuard>,
 }
 
 enum SnapshotWorkingCopyError {
@@ -1279,6 +1285,11 @@ impl WorkspaceCommandHelper {
         let op_summary_template_text = settings.get_string("templates.op_summary")?;
         let may_update_working_copy =
             may_snapshot_working_copy && env.command.should_commit_transaction();
+        #[cfg(feature = "git")]
+        let git_write_batch = repo
+            .store()
+            .backend_impl::<GitBackend>()
+            .map(GitBackend::start_write_batch);
 
         let helper = Self {
             workspace,
@@ -1288,6 +1299,8 @@ impl WorkspaceCommandHelper {
             op_summary_template_text,
             may_snapshot_working_copy,
             may_update_working_copy,
+            #[cfg(feature = "git")]
+            _git_write_batch: git_write_batch,
         };
         // Parse commit_summary template early to report error before starting
         // mutable operation.
@@ -2413,6 +2426,11 @@ to the current parents may contain changes from multiple commits.
                 .maybe_commit_transaction(tx, description)
                 .await?,
         );
+
+        #[cfg(feature = "git")]
+        if let Some(write_batch) = self._git_write_batch.take() {
+            write_batch.finish()?;
+        }
 
         // Update working copy before reporting repo changes, so that
         // potential errors while reporting changes (broken pipe, etc)

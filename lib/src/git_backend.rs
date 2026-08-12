@@ -91,7 +91,7 @@ use crate::repo_path::RepoPathComponentBuf;
 use crate::settings::UserSettings;
 use crate::stacked_table::MutableTable;
 use crate::stacked_table::ReadonlyTable;
-use crate::stacked_table::TableSegment as _;
+use crate::stacked_table::TableSegment;
 use crate::stacked_table::TableStore;
 use crate::stacked_table::TableStoreError;
 
@@ -190,10 +190,124 @@ pub struct GitBackend {
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
     shallow_root_ids: OnceLock<Vec<CommitId>>,
-    extra_metadata_store: TableStore,
-    cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
+    extra_metadata_store: Arc<TableStore>,
+    cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
+    write_batch_state: Arc<Mutex<GitWriteBatchState>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
+}
+
+#[derive(Default)]
+struct GitWriteBatch {
+    table: Option<MutableTable>,
+    table_lock: Option<FileLock>,
+}
+
+#[derive(Default)]
+struct GitWriteBatchState {
+    batch: Option<GitWriteBatch>,
+    users: usize,
+}
+
+enum GitWriteTable<'a> {
+    Batch(&'a mut MutableTable),
+    Direct {
+        table: Arc<ReadonlyTable>,
+        table_lock: FileLock,
+    },
+}
+
+impl GitWriteTable<'_> {
+    fn get_value(&self, key: &[u8]) -> Option<&[u8]> {
+        match self {
+            Self::Batch(table) => table.get_value(key),
+            Self::Direct { table, .. } => table.get_value(key),
+        }
+    }
+
+    fn finish(self, backend: &GitBackend, key: Vec<u8>, value: Vec<u8>) -> BackendResult<()> {
+        match self {
+            Self::Batch(table) => {
+                table.add_entry(key, value);
+                Ok(())
+            }
+            Self::Direct { table, table_lock } => {
+                let mut mut_table = table.start_mutation();
+                mut_table.add_entry(key, value);
+                backend.save_extra_metadata_table(mut_table, &table_lock)
+            }
+        }
+    }
+}
+
+/// Keeps the extra metadata table lock across a group of commit writes.
+pub struct GitWriteBatchGuard {
+    state: Arc<Mutex<GitWriteBatchState>>,
+    extra_metadata_store: Arc<TableStore>,
+    cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
+    finished: bool,
+}
+
+impl GitWriteBatch {
+    fn table<'a>(&'a mut self, backend: &GitBackend) -> BackendResult<&'a mut MutableTable> {
+        if self.table.is_none() {
+            let (table, table_lock) = backend.read_extra_metadata_table_locked()?;
+            self.table = Some(table.start_mutation());
+            self.table_lock = Some(table_lock);
+        }
+        Ok(self.table.as_mut().unwrap())
+    }
+
+    fn finish(
+        self,
+        extra_metadata_store: &TableStore,
+        cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
+    ) -> BackendResult<()> {
+        let Some(mut_table) = self.table else {
+            return Ok(());
+        };
+        let table_lock = self.table_lock.expect("metadata table lock missing");
+        let table = extra_metadata_store
+            .save_table(mut_table)
+            .map_err(GitBackendError::WriteMetadata)?;
+        *cached_extra_metadata.lock().unwrap() = Some(table);
+        drop(table_lock);
+        Ok(())
+    }
+}
+
+impl GitWriteBatchGuard {
+    fn finish_inner(&mut self) -> BackendResult<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let batch = {
+            let mut state = self.state.lock().unwrap();
+            state.users -= 1;
+            if state.users == 0 {
+                state.batch.take()
+            } else {
+                None
+            }
+        };
+        if let Some(batch) = batch {
+            batch.finish(&self.extra_metadata_store, &self.cached_extra_metadata)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> BackendResult<()> {
+        self.finish_inner()
+    }
+}
+
+impl Drop for GitWriteBatchGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.finish_inner() {
+            tracing::error!(?err, "Failed to flush Git extra metadata write batch");
+        }
+    }
 }
 
 impl GitBackend {
@@ -218,10 +332,26 @@ impl GitBackend {
             root_change_id,
             empty_tree_id,
             shallow_root_ids: OnceLock::new(),
-            extra_metadata_store,
-            cached_extra_metadata: Mutex::new(None),
+            extra_metadata_store: Arc::new(extra_metadata_store),
+            cached_extra_metadata: Arc::new(Mutex::new(None)),
+            write_batch_state: Arc::new(Mutex::new(GitWriteBatchState::default())),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
+        }
+    }
+
+    pub fn start_write_batch(&self) -> GitWriteBatchGuard {
+        let mut state = self.write_batch_state.lock().unwrap();
+        if state.users == 0 {
+            debug_assert!(state.batch.is_none());
+            state.batch = Some(GitWriteBatch::default());
+        }
+        state.users += 1;
+        GitWriteBatchGuard {
+            state: self.write_batch_state.clone(),
+            extra_metadata_store: self.extra_metadata_store.clone(),
+            cached_extra_metadata: self.cached_extra_metadata.clone(),
+            finished: false,
         }
     }
 
@@ -450,6 +580,23 @@ impl GitBackend {
         }
     }
 
+    fn extra_metadata_for_commit(&self, id: &CommitId) -> BackendResult<Option<Vec<u8>>> {
+        let pending = self
+            .write_batch_state
+            .lock()
+            .unwrap()
+            .batch
+            .as_ref()
+            .and_then(|batch| batch.table.as_ref())
+            .and_then(|table| table.get_value(id.as_bytes()))
+            .map(<[u8]>::to_vec);
+        if pending.is_some() {
+            return Ok(pending);
+        }
+        let table = self.cached_extra_metadata_table()?;
+        Ok(table.get_value(id.as_bytes()).map(<[u8]>::to_vec))
+    }
+
     fn read_extra_metadata_table_locked(&self) -> BackendResult<(Arc<ReadonlyTable>, FileLock)> {
         let table = self
             .extra_metadata_store
@@ -490,9 +637,29 @@ impl GitBackend {
             return Ok(());
         }
 
+        // Keep the lock order consistent with write_commit(): Git repository,
+        // then the extra metadata table.
+        let locked_repo = self.lock_git_repo();
+        let mut write_batch_state = self.write_batch_state.lock().unwrap();
+        if let Some(batch) = write_batch_state.batch.as_mut() {
+            // Reuse the command-scoped table and lock if a read discovers a Git
+            // commit that hasn't been imported yet.
+            locked_repo
+                .edit_references(head_ids.iter().copied().map(to_no_gc_ref_update))
+                .map_err(|err| BackendError::Other(Box::new(err)))?;
+            let table = batch.table(self)?;
+            import_extra_metadata_entries_from_heads(
+                &locked_repo,
+                table,
+                &head_ids,
+                self.shallow_root_ids(&locked_repo)?,
+            )?;
+            return Ok(());
+        }
+        drop(write_batch_state);
+
         // Create no-gc ref even if known to the extras table. Concurrent GC
         // process might have deleted the no-gc ref.
-        let locked_repo = self.lock_git_repo();
         locked_repo
             .edit_references(head_ids.iter().copied().map(to_no_gc_ref_update))
             .map_err(|err| BackendError::Other(Box::new(err)))?;
@@ -508,7 +675,6 @@ impl GitBackend {
         import_extra_metadata_entries_from_heads(
             &locked_repo,
             &mut mut_table,
-            &table_lock,
             &head_ids,
             self.shallow_root_ids(&locked_repo)?,
         )?;
@@ -1038,7 +1204,6 @@ fn to_invalid_utf8_err(source: Utf8Error, id: &impl ObjectId) -> BackendError {
 fn import_extra_metadata_entries_from_heads(
     git_repo: &gix::Repository,
     mut_table: &mut MutableTable,
-    _table_lock: &FileLock,
     head_ids: &HashSet<&CommitId>,
     shallow_roots: &[CommitId],
 ) -> BackendResult<()> {
@@ -1300,9 +1465,8 @@ impl Backend for GitBackend {
             commit.parents.push(self.root_commit_id.clone());
         }
 
-        let table = self.cached_extra_metadata_table()?;
-        if let Some(extras) = table.get_value(id.as_bytes()) {
-            deserialize_extras(&mut commit, extras);
+        if let Some(extras) = self.extra_metadata_for_commit(id)? {
+            deserialize_extras(&mut commit, &extras);
         } else {
             // TODO: Remove this hack and map to ObjectNotFound error if we're sure that
             // there are no reachable ancestor commits without extras metadata. Git commits
@@ -1310,9 +1474,10 @@ impl Backend for GitBackend {
             // https://github.com/jj-vcs/jj/issues/2343
             tracing::info!("unimported Git commit found");
             self.import_head_commits([id])?;
-            let table = self.cached_extra_metadata_table()?;
-            let extras = table.get_value(id.as_bytes()).unwrap();
-            deserialize_extras(&mut commit, extras);
+            let extras = self
+                .extra_metadata_for_commit(id)?
+                .expect("imported Git commit should have extra metadata");
+            deserialize_extras(&mut commit, &extras);
         }
         Ok(commit)
     }
@@ -1403,7 +1568,13 @@ impl Backend for GitBackend {
         // To prevent such race condition locally, we extend the scope covered by the
         // table lock. This is still racy if multiple machines are involved and the
         // repository is rsync-ed.
-        let (table, table_lock) = self.read_extra_metadata_table_locked()?;
+        let mut write_batch_state = self.write_batch_state.lock().unwrap();
+        let metadata_table = if let Some(batch) = write_batch_state.batch.as_mut() {
+            GitWriteTable::Batch(batch.table(self)?)
+        } else {
+            let (table, table_lock) = self.read_extra_metadata_table_locked()?;
+            GitWriteTable::Direct { table, table_lock }
+        };
         let id = loop {
             let mut commit = gix::objs::Commit {
                 message: message.to_owned().into(),
@@ -1439,7 +1610,7 @@ impl Backend for GitBackend {
                         source: Box::new(err),
                     })?;
 
-            match table.get_value(git_id.as_bytes()) {
+            match metadata_table.get_value(git_id.as_bytes()) {
                 Some(existing_extras) if existing_extras != extras => {
                     // It's possible a commit already exists with the same
                     // commit id but different change id. Adjust the timestamp
@@ -1469,9 +1640,7 @@ impl Backend for GitBackend {
         // Update the signature to match the one that was actually written to the object
         // store
         contents.committer.timestamp.timestamp = MillisSinceEpoch(committer.time.seconds * 1000);
-        let mut mut_table = table.start_mutation();
-        mut_table.add_entry(id.to_bytes(), extras);
-        self.save_extra_metadata_table(mut_table, &table_lock)?;
+        metadata_table.finish(self, id.to_bytes(), extras)?;
         Ok((id, contents))
     }
 
@@ -2105,12 +2274,14 @@ mod tests {
             secure_sig: None,
         };
 
+        let write_batch = backend.start_write_batch();
         let (initial_commit_id, _init_commit) = backend.write_commit(commit, None).block_on()?;
         let commit = backend.read_commit(&initial_commit_id).block_on()?;
         assert_eq!(
             commit.change_id, original_change_id,
             "The change-id header did not roundtrip"
         );
+        write_batch.finish()?;
 
         // Because of how change ids are also persisted in extra proto files,
         // initialize a new store without those files, but reuse the same git
