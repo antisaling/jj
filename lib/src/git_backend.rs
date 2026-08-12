@@ -192,7 +192,7 @@ pub struct GitBackend {
     base_repo: gix::ThreadSafeRepository,
     objects_dir: PathBuf,
     repo: Mutex<gix::Repository>,
-    write_repos: Arc<GitRepoPool>,
+    write_repos: Arc<GitWriteRepoPool>,
     read_repos: Arc<GitReadRepoPool>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
@@ -206,9 +206,16 @@ pub struct GitBackend {
     write_change_id_header: bool,
 }
 
-struct GitRepoPool {
+struct GitReadRepoPool {
     repos: Vec<Mutex<gix::Repository>>,
     next: AtomicUsize,
+}
+
+struct GitWriteRepoPool {
+    // Slot 0 is for calls made outside Rayon. The remaining slots correspond
+    // one-to-one with Rayon worker indexes, so concurrent writers don't fight
+    // over a round-robin repository mutex.
+    repos: Vec<Mutex<gix::Repository>>,
 }
 
 struct GitTreeEntry<'a> {
@@ -252,7 +259,7 @@ fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>>
     Ok(bytes)
 }
 
-impl GitRepoPool {
+impl GitReadRepoPool {
     fn new(base_repo: &gix::ThreadSafeRepository, object_cache_size: Option<usize>) -> Self {
         let repos = (0..GIT_TREE_READ_CONCURRENCY)
             .map(|_| {
@@ -277,7 +284,24 @@ impl GitRepoPool {
     }
 }
 
-type GitReadRepoPool = GitRepoPool;
+impl GitWriteRepoPool {
+    fn new(base_repo: &gix::ThreadSafeRepository) -> Self {
+        let repos = (0..rayon::current_num_threads().max(1) + 1)
+            .map(|_| {
+                let mut repo = base_repo.to_thread_local();
+                repo.objects.refresh_never();
+                Mutex::new(repo)
+            })
+            .collect();
+        Self { repos }
+    }
+
+    fn with_repo<T>(&self, f: impl FnOnce(&mut gix::Repository) -> T) -> T {
+        let index = rayon::current_thread_index().map_or(0, |index| index + 1);
+        let mut repo = self.repos[index].lock().unwrap();
+        f(&mut repo)
+    }
+}
 
 #[derive(Default)]
 struct GitWriteBatch {
@@ -412,12 +436,12 @@ impl GitBackend {
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id =
             TreeId::from_bytes(gix::ObjectId::empty_tree(repo.object_hash()).as_bytes());
-        let write_repos = Arc::new(GitRepoPool::new(&base_repo, None));
+        let repo = Mutex::new(repo);
+        let write_repos = Arc::new(GitWriteRepoPool::new(&base_repo));
         let read_repos = Arc::new(GitReadRepoPool::new(
             &base_repo,
             Some(GIT_OBJECT_CACHE_SIZE),
         ));
-        let repo = Mutex::new(repo);
         Self {
             base_repo,
             objects_dir,
@@ -874,7 +898,7 @@ impl GitBackend {
 fn write_object_with_known_id_on_pool(
     objects_dir: &Path,
     written_objects: &Mutex<HashSet<gix::hash::ObjectId>>,
-    write_repos: &GitRepoPool,
+    write_repos: &GitWriteRepoPool,
     kind: gix::objs::Kind,
     bytes: &[u8],
     oid: gix::hash::ObjectId,
