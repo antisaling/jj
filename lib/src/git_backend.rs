@@ -192,6 +192,7 @@ pub struct GitBackend {
     extra_metadata_store: Arc<TableStore>,
     cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
     write_batch_state: Arc<Mutex<GitWriteBatchState>>,
+    written_objects: Mutex<HashSet<gix::hash::ObjectId>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
 }
@@ -338,6 +339,7 @@ impl GitBackend {
             extra_metadata_store: Arc::new(extra_metadata_store),
             cached_extra_metadata: Arc::new(Mutex::new(None)),
             write_batch_state: Arc::new(Mutex::new(GitWriteBatchState::default())),
+            written_objects: Mutex::new(HashSet::new()),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
         }
@@ -754,9 +756,25 @@ impl GitBackend {
             source: Box::new(err),
         })?;
 
-        let locked_repo = self.lock_git_repo();
-        write_object_with_known_id(&locked_repo, gix::objs::Kind::Blob, bytes, oid, object_type)?;
+        self.write_object_with_known_id(gix::objs::Kind::Blob, bytes, oid, object_type)?;
         Ok(oid)
+    }
+
+    fn write_object_with_known_id(
+        &self,
+        kind: gix::objs::Kind,
+        bytes: &[u8],
+        oid: gix::hash::ObjectId,
+        object_type: &'static str,
+    ) -> BackendResult<()> {
+        let mut written_objects = self.written_objects.lock().unwrap();
+        if written_objects.contains(&oid) {
+            return Ok(());
+        }
+        let locked_repo = self.lock_git_repo();
+        write_object_with_known_id(&locked_repo, kind, bytes, oid, object_type)?;
+        written_objects.insert(oid);
+        Ok(())
     }
 }
 
@@ -1481,8 +1499,7 @@ impl Backend for GitBackend {
             object_type: "tree",
             source: Box::new(err),
         })?;
-        let locked_repo = self.lock_git_repo();
-        write_object_with_known_id(&locked_repo, gix::objs::Kind::Tree, &bytes, oid, "tree")?;
+        self.write_object_with_known_id(gix::objs::Kind::Tree, &bytes, oid, "tree")?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
     }
 
