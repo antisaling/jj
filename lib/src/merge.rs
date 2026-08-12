@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Generic data structures and algorithms for working with merges and diffs of
-//! values.
+//! Generic algorithms for working with merged values, plus specializations for
+//! some common types of merged values.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::fmt::Write as _;
 use std::hash::Hash;
 use std::iter;
 use std::iter::zip;
 use std::ops::Deref;
 use std::slice;
+use std::sync::Arc;
 
 use futures::future::try_join_all;
 use itertools::Itertools as _;
@@ -31,8 +34,17 @@ use smallvec::SmallVec;
 use smallvec::smallvec;
 use smallvec::smallvec_inline;
 
+use crate::backend::BackendResult;
+use crate::backend::CopyId;
+use crate::backend::FileId;
+use crate::backend::TreeValue;
+use crate::conflict_labels::ConflictLabels;
 use crate::content_hash::ContentHash;
 use crate::content_hash::DigestUpdate;
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathComponent;
+use crate::store::Store;
+use crate::tree::Tree;
 
 /// A generic diff/transition from one value to another.
 ///
@@ -187,12 +199,6 @@ where
 pub struct Merge<T> {
     /// Alternates between positive and negative terms, starting with positive.
     values: SmallVec<[T; 1]>,
-}
-
-impl<T: ContentHash> ContentHash for Merge<T> {
-    fn hash(&self, state: &mut impl DigestUpdate) {
-        self.as_slice().hash(state);
-    }
 }
 
 impl<T: Debug> Debug for Merge<T> {
@@ -492,7 +498,7 @@ impl<T> Merge<T> {
 
     /// Simplifies the merge using a hash index to find canceling terms.
     #[must_use]
-    pub fn simplify_with_hash(&self) -> Self
+    pub(crate) fn simplify_with_hash(&self) -> Self
     where
         T: Eq + Hash + Clone,
     {
@@ -800,6 +806,301 @@ impl<T> Merge<Merge<T>> {
             result.values.extend(add.values);
         }
         result
+    }
+}
+
+impl<T: ContentHash> ContentHash for Merge<T> {
+    fn hash(&self, state: &mut impl DigestUpdate) {
+        self.values.hash(state);
+    }
+}
+
+/// Borrowed `MergedTreeValue`.
+pub type MergedTreeVal<'a> = Merge<Option<&'a TreeValue>>;
+
+/// The value at a given path in a commit.
+///
+/// It depends on the context whether it can be absent
+/// (`Merge::is_absent()`). For example, when getting the value at a
+/// specific path, it may be, but when iterating over entries in a
+/// tree, it shouldn't be.
+pub type MergedTreeValue = Merge<Option<TreeValue>>;
+
+impl<T> Merge<Option<T>>
+where
+    T: Borrow<TreeValue>,
+{
+    /// Whether this merge should be recursed into when doing directory walks.
+    pub fn is_tree(&self) -> bool {
+        self.is_present()
+            && self.iter().all(|value| {
+                matches!(
+                    borrow_tree_value(value.as_ref()),
+                    Some(TreeValue::Tree(_)) | None
+                )
+            })
+    }
+
+    /// Whether this merge is present and not a tree
+    pub fn is_file_like(&self) -> bool {
+        self.is_present() && !self.is_tree()
+    }
+
+    /// If this merge contains only files or absent entries, returns a merge of
+    /// the `FileId`s. The executable bits and copy IDs will be ignored. Use
+    /// `Merge::with_new_file_ids()` to produce a new merge with the original
+    /// executable bits preserved.
+    pub fn to_file_merge(&self) -> Option<Merge<Option<FileId>>> {
+        let file_ids = self
+            .try_map(|term| match borrow_tree_value(term.as_ref()) {
+                None => Ok(None),
+                Some(TreeValue::File {
+                    id,
+                    executable: _,
+                    copy_id: _,
+                }) => Ok(Some(id.clone())),
+                _ => Err(()),
+            })
+            .ok()?;
+
+        Some(file_ids)
+    }
+
+    /// If this merge contains only files or absent entries, returns a merge of
+    /// the files' executable bits.
+    pub fn to_executable_merge(&self) -> Option<Merge<Option<bool>>> {
+        self.try_map(|term| match borrow_tree_value(term.as_ref()) {
+            None => Ok(None),
+            Some(TreeValue::File {
+                id: _,
+                executable,
+                copy_id: _,
+            }) => Ok(Some(*executable)),
+            _ => Err(()),
+        })
+        .ok()
+    }
+
+    /// If this merge contains only files or absent entries, returns a merge of
+    /// the files' copy IDs.
+    pub fn to_copy_id_merge(&self) -> Option<Merge<Option<CopyId>>> {
+        self.try_map(|term| match borrow_tree_value(term.as_ref()) {
+            None => Ok(None),
+            Some(TreeValue::File {
+                id: _,
+                executable: _,
+                copy_id,
+            }) => Ok(Some(copy_id.clone())),
+            _ => Err(()),
+        })
+        .ok()
+    }
+
+    /// If every non-`None` term of a `MergedTreeValue`
+    /// is a `TreeValue::Tree`, this converts it to
+    /// a `Merge<Tree>`, with empty trees instead of
+    /// any `None` terms. Otherwise, returns `None`.
+    pub async fn to_tree_merge(
+        &self,
+        store: &Arc<Store>,
+        dir: &RepoPath,
+    ) -> BackendResult<Option<Merge<Tree>>> {
+        let tree_id_merge = self.try_map(|term| match borrow_tree_value(term.as_ref()) {
+            None => Ok(None),
+            Some(TreeValue::Tree(id)) => Ok(Some(id)),
+            Some(_) => Err(()),
+        });
+        if let Ok(tree_id_merge) = tree_id_merge {
+            Ok(Some(
+                tree_id_merge
+                    .try_map_async(async |id| {
+                        if let Some(id) = id {
+                            store.get_tree(dir.to_owned(), id).await
+                        } else {
+                            Ok(Tree::empty(store.clone(), dir.to_owned()))
+                        }
+                    })
+                    .await?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Creates a new merge with the file ids from the given merge. In other
+    /// words, the executable bits and copy IDs from `self` will be preserved.
+    ///
+    /// The given `file_ids` should have the same shape as `self`. Only the
+    /// `FileId` values may differ.
+    pub fn with_new_file_ids(&self, file_ids: &Merge<Option<FileId>>) -> Merge<Option<TreeValue>> {
+        assert_eq!(self.values.len(), file_ids.values.len());
+        let values = zip(self, file_ids.iter().cloned())
+            .map(
+                |(tree_value, file_id)| match (borrow_tree_value(tree_value.as_ref()), file_id) {
+                    (
+                        Some(TreeValue::File {
+                            id: _,
+                            executable,
+                            copy_id,
+                        }),
+                        Some(id),
+                    ) => Some(TreeValue::File {
+                        id,
+                        executable: *executable,
+                        copy_id: copy_id.clone(),
+                    }),
+                    (None, None) => None,
+                    // New files are populated to preserve the materialized conflict. The file won't
+                    // be checked out to the disk. So the metadata is not important, and we will
+                    // just use the default values.
+                    (None, Some(id)) => Some(TreeValue::File {
+                        id,
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    }),
+                    (old, new) => panic!("incompatible update: {old:?} to {new:?}"),
+                },
+            )
+            .collect();
+        Merge { values }
+    }
+
+    /// Give a summary description of the conflict's "removes" and "adds"
+    pub fn describe(&self, labels: &ConflictLabels) -> String {
+        let mut buf = String::new();
+        writeln!(buf, "Conflict:").unwrap();
+        for (term, label) in self
+            .removes()
+            .enumerate()
+            .filter_map(|(i, term)| term.as_ref().map(|term| (term, labels.get_remove(i))))
+        {
+            write!(buf, "  Removing {}", describe_conflict_term(term.borrow())).unwrap();
+            if let Some(label) = label {
+                write!(buf, " ({label})").unwrap();
+            }
+            buf.push('\n');
+        }
+        for (term, label) in self
+            .adds()
+            .enumerate()
+            .filter_map(|(i, term)| term.as_ref().map(|term| (term, labels.get_add(i))))
+        {
+            write!(buf, "  Adding {}", describe_conflict_term(term.borrow())).unwrap();
+            if let Some(label) = label {
+                write!(buf, " ({label})").unwrap();
+            }
+            buf.push('\n');
+        }
+        buf
+    }
+}
+
+fn borrow_tree_value<T: Borrow<TreeValue> + ?Sized>(term: Option<&T>) -> Option<&TreeValue> {
+    term.map(|value| value.borrow())
+}
+
+fn describe_conflict_term(value: &TreeValue) -> String {
+    match value {
+        TreeValue::File {
+            id,
+            executable: false,
+            copy_id: _,
+        } => {
+            // TODO: include the copy here once we start using it
+            format!("file with id {id}")
+        }
+        TreeValue::File {
+            id,
+            executable: true,
+            copy_id: _,
+        } => {
+            // TODO: include the copy here once we start using it
+            format!("executable file with id {id}")
+        }
+        TreeValue::Symlink(id) => {
+            format!("symlink with id {id}")
+        }
+        TreeValue::Tree(id) => {
+            format!("tree with id {id}")
+        }
+        TreeValue::GitSubmodule(id) => {
+            format!("Git submodule with id {id}")
+        }
+    }
+}
+
+impl Merge<Tree> {
+    /// The directory that is shared by all trees in the merge.
+    pub fn dir(&self) -> &RepoPath {
+        debug_assert!(self.iter().map(|tree| tree.dir()).all_equal());
+        self.first().dir()
+    }
+
+    /// The value at the given basename. The value can be `Resolved` even if
+    /// `self` is conflicted, which happens if the value at the path can be
+    /// trivially merged. Does not recurse, so if `basename` refers to a Tree,
+    /// then a `TreeValue::Tree` will be returned.
+    pub fn value(&self, basename: &RepoPathComponent) -> MergedTreeVal<'_> {
+        if let Some(tree) = self.as_resolved() {
+            return Merge::resolved(tree.value(basename));
+        }
+        let same_change = self.first().store().merge_options().same_change;
+        let value = self.map(|tree| tree.value(basename));
+        if let Some(resolved) = value.resolve_trivial(same_change) {
+            return Merge::resolved(*resolved);
+        }
+        value
+    }
+
+    /// Gets the `Merge<Tree>` in a subdirectory of the current tree. If the
+    /// path doesn't correspond to a tree in any of the inputs to the merge,
+    /// then that entry will be replaced by an empty tree in the result.
+    pub async fn sub_tree(&self, name: &RepoPathComponent) -> BackendResult<Option<Self>> {
+        let store = self.first().store();
+        match self.value(name).into_resolved() {
+            Ok(Some(TreeValue::Tree(sub_tree_id))) => {
+                let subdir = self.dir().join(name);
+                Ok(Some(Self::resolved(
+                    store.get_tree(subdir, sub_tree_id).await?,
+                )))
+            }
+            Ok(_) => Ok(None),
+            Err(merge) => {
+                if !merge.is_tree() {
+                    return Ok(None);
+                }
+                let trees = merge
+                    .try_map_async(async |value| match value {
+                        Some(TreeValue::Tree(sub_tree_id)) => {
+                            let subdir = self.dir().join(name);
+                            store.get_tree(subdir, sub_tree_id).await
+                        }
+                        Some(_) => unreachable!(),
+                        None => {
+                            let subdir = self.dir().join(name);
+                            Ok(Tree::empty(store.clone(), subdir))
+                        }
+                    })
+                    .await?;
+                Ok(Some(trees))
+            }
+        }
+    }
+
+    /// Look up the tree at the given path.
+    pub async fn sub_tree_recursive(&self, path: &RepoPath) -> BackendResult<Option<Self>> {
+        let mut current_tree = self.clone();
+        for name in path.components() {
+            match current_tree.sub_tree(name).await? {
+                None => {
+                    return Ok(None);
+                }
+                Some(sub_tree) => {
+                    current_tree = sub_tree;
+                }
+            }
+        }
+        Ok(Some(current_tree))
     }
 }
 
@@ -1223,6 +1524,16 @@ mod tests {
     fn test_merge_invariants() {
         fn check_invariants(terms: &[u32]) {
             let merge = Merge::from_vec(terms.to_vec());
+            assert_eq!(
+                merge.get_simplified_mapping_with_hash(),
+                merge.get_simplified_mapping(),
+                "hash simplification changed the mapping for {merge:?}"
+            );
+            assert_eq!(
+                merge.simplify_by_with_hash(|term| term),
+                merge.simplify_by(|term| term),
+                "hash simplify-by changed the result for {merge:?}"
+            );
             // `simplify()` is idempotent
             assert_eq!(
                 merge.simplify().simplify(),

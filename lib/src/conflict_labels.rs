@@ -121,7 +121,7 @@ impl ConflictLabels {
     }
 
     /// Hash-indexed version of [`Self::simplify_with`].
-    pub fn simplify_with_hash<T: Eq + Hash + Clone>(
+    pub(crate) fn simplify_with_hash<T: Eq + Hash + Clone>(
         &self,
         merge: &Merge<T>,
     ) -> (Self, Merge<T>) {

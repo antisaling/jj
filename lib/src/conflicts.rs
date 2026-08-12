@@ -273,7 +273,7 @@ pub async fn try_materialize_file_conflict_value(
     else {
         return Ok(None);
     };
-    let (labels, ids) = conflict_labels.simplify_with(&unsimplified_ids);
+    let (labels, ids) = conflict_labels.simplify_with_hash(&unsimplified_ids);
     let contents = extract_as_single_hunk(&ids, store, path).await?;
     let executable = resolve_file_executable(&executable_bits);
     Ok(Some(MaterializedFileConflictValue {

@@ -29,6 +29,7 @@ use std::process::Command;
 use std::process::ExitStatus;
 use std::str::Utf8Error;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::SystemTime;
@@ -98,7 +99,10 @@ use crate::stacked_table::TableStoreError;
 
 const CHANGE_ID_LENGTH: usize = 16;
 const GIT_TREE_READ_CONCURRENCY: usize = 4;
-const GIT_OBJECT_CACHE_SIZE: usize = 16 * 1024 * 1024;
+const GIT_OBJECT_CACHE_SIZE: usize = 3 * 1024 * 1024 * 1024;
+const GIT_OBJECT_CACHE_SHARDS: usize = 16;
+const GIT_PACK_CACHE_SIZE: usize = 3 * 1024 * 1024 * 1024;
+const GIT_PACK_CACHE_SHARDS: usize = 16;
 /// Ref namespace used only for preventing GC.
 const NO_GC_REF_NAMESPACE: &str = "refs/jj/keep/";
 
@@ -199,7 +203,7 @@ pub struct GitBackend {
     extra_metadata_store: Arc<TableStore>,
     cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
     write_batch_state: Arc<Mutex<GitWriteBatchState>>,
-    written_objects: Arc<Mutex<HashSet<gix::hash::ObjectId>>>,
+    written_objects: Arc<GitObjectWriteTracker>,
     git_executable: PathBuf,
     write_change_id_header: bool,
 }
@@ -209,6 +213,162 @@ struct GitReadRepoPool {
     // one-to-one with Rayon worker indexes, so concurrent readers don't fight
     // over a round-robin repository mutex.
     repos: Vec<Mutex<gix::Repository>>,
+}
+
+type GitObjectCacheShards = Arc<[Mutex<gix::odb::pack::cache::object::MemoryCappedHashmap>]>;
+type GitPackCacheShards = Arc<[Mutex<gix::odb::pack::cache::lru::MemoryCappedHashmap>]>;
+
+struct SharedGitObjectCache {
+    shards: GitObjectCacheShards,
+}
+
+#[derive(Default)]
+struct GitObjectWriteTracker {
+    state: Mutex<GitObjectWriteState>,
+    completed: Condvar,
+}
+
+#[derive(Default)]
+struct GitObjectWriteState {
+    written: HashSet<gix::hash::ObjectId>,
+    in_flight: HashSet<gix::hash::ObjectId>,
+}
+
+impl GitObjectWriteTracker {
+    fn write_once(
+        &self,
+        oid: gix::hash::ObjectId,
+        write: impl FnOnce() -> BackendResult<()>,
+    ) -> BackendResult<()> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.written.contains(&oid) {
+                return Ok(());
+            }
+            if state.in_flight.insert(oid) {
+                break;
+            }
+            state = self.completed.wait(state).unwrap();
+        }
+        drop(state);
+
+        let result = write();
+        let mut state = self.state.lock().unwrap();
+        state.in_flight.remove(&oid);
+        if result.is_ok() {
+            state.written.insert(oid);
+        }
+        self.completed.notify_all();
+        result
+    }
+}
+
+impl SharedGitObjectCache {
+    fn shard(
+        &self,
+        id: &gix::hash::ObjectId,
+    ) -> &Mutex<gix::odb::pack::cache::object::MemoryCappedHashmap> {
+        &self.shards[usize::from(id.as_bytes()[0]) % self.shards.len()]
+    }
+}
+
+impl gix::odb::pack::cache::Object for SharedGitObjectCache {
+    fn put(&mut self, id: gix::hash::ObjectId, kind: gix::objs::Kind, data: &[u8]) {
+        gix::odb::pack::cache::Object::put(&mut *self.shard(&id).lock().unwrap(), id, kind, data);
+    }
+
+    fn get(&mut self, id: &gix::hash::ObjectId, out: &mut Vec<u8>) -> Option<gix::objs::Kind> {
+        gix::odb::pack::cache::Object::get(&mut *self.shard(id).lock().unwrap(), id, out)
+    }
+}
+
+struct SharedGitPackCache {
+    shards: GitPackCacheShards,
+}
+
+impl SharedGitPackCache {
+    fn shard(
+        &self,
+        pack_id: u32,
+        offset: u64,
+    ) -> &Mutex<gix::odb::pack::cache::lru::MemoryCappedHashmap> {
+        let hash = u64::from(pack_id).wrapping_mul(0x9e37_79b9) ^ offset;
+        &self.shards[hash as usize % self.shards.len()]
+    }
+}
+
+impl gix::odb::pack::cache::DecodeEntry for SharedGitPackCache {
+    fn put(
+        &mut self,
+        pack_id: u32,
+        offset: u64,
+        data: &[u8],
+        kind: gix::objs::Kind,
+        compressed_size: usize,
+    ) {
+        gix::odb::pack::cache::DecodeEntry::put(
+            &mut *self.shard(pack_id, offset).lock().unwrap(),
+            pack_id,
+            offset,
+            data,
+            kind,
+            compressed_size,
+        );
+    }
+
+    fn get(
+        &mut self,
+        pack_id: u32,
+        offset: u64,
+        out: &mut Vec<u8>,
+    ) -> Option<(gix::objs::Kind, usize)> {
+        gix::odb::pack::cache::DecodeEntry::get(
+            &mut *self.shard(pack_id, offset).lock().unwrap(),
+            pack_id,
+            offset,
+            out,
+        )
+    }
+}
+
+fn new_git_object_cache() -> GitObjectCacheShards {
+    let shard_capacity = GIT_OBJECT_CACHE_SIZE.div_ceil(GIT_OBJECT_CACHE_SHARDS);
+    (0..GIT_OBJECT_CACHE_SHARDS)
+        .map(|_| {
+            Mutex::new(gix::odb::pack::cache::object::MemoryCappedHashmap::new(
+                shard_capacity,
+            ))
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn new_git_pack_cache() -> GitPackCacheShards {
+    let shard_capacity = GIT_PACK_CACHE_SIZE.div_ceil(GIT_PACK_CACHE_SHARDS);
+    (0..GIT_PACK_CACHE_SHARDS)
+        .map(|_| {
+            Mutex::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(
+                shard_capacity,
+            ))
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn set_git_object_cache(repo: &mut gix::Repository, shards: GitObjectCacheShards) {
+    repo.objects.set_object_cache(move || {
+        Box::new(SharedGitObjectCache {
+            shards: shards.clone(),
+        })
+    });
+}
+
+fn set_git_pack_cache(repo: &mut gix::Repository, shards: GitPackCacheShards) {
+    repo.objects.set_pack_cache(move || {
+        Box::new(SharedGitPackCache {
+            shards: shards.clone(),
+        })
+    });
 }
 
 struct GitWriteRepoPool {
@@ -260,14 +420,17 @@ fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>>
 }
 
 impl GitReadRepoPool {
-    fn new(base_repo: &gix::ThreadSafeRepository, object_cache_size: Option<usize>) -> Self {
+    fn new(
+        base_repo: &gix::ThreadSafeRepository,
+        object_cache: GitObjectCacheShards,
+        pack_cache: GitPackCacheShards,
+    ) -> Self {
         let repos = (0..rayon::current_num_threads().max(1) + 1)
             .map(|_| {
                 let mut repo = base_repo.to_thread_local();
                 repo.objects.refresh_never();
-                if let Some(object_cache_size) = object_cache_size {
-                    repo.object_cache_size(Some(object_cache_size));
-                }
+                set_git_object_cache(&mut repo, object_cache.clone());
+                set_git_pack_cache(&mut repo, pack_cache.clone());
                 Mutex::new(repo)
             })
             .collect();
@@ -428,17 +591,17 @@ impl GitBackend {
         // Rebase writes many objects that are intentionally not in the ODB yet.
         // Don't rescan the ODB from disk after every expected miss.
         repo.objects.refresh_never();
-        repo.object_cache_size(Some(GIT_OBJECT_CACHE_SIZE));
+        let object_cache = new_git_object_cache();
+        let pack_cache = new_git_pack_cache();
+        set_git_object_cache(&mut repo, object_cache.clone());
+        set_git_pack_cache(&mut repo, pack_cache.clone());
         let root_commit_id = CommitId::from_bytes(repo.object_hash().null_ref().as_bytes());
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id =
             TreeId::from_bytes(gix::ObjectId::empty_tree(repo.object_hash()).as_bytes());
         let repo = Mutex::new(repo);
         let write_repos = Arc::new(GitWriteRepoPool::new(&base_repo));
-        let read_repos = Arc::new(GitReadRepoPool::new(
-            &base_repo,
-            Some(GIT_OBJECT_CACHE_SIZE),
-        ));
+        let read_repos = Arc::new(GitReadRepoPool::new(&base_repo, object_cache, pack_cache));
         Self {
             base_repo,
             objects_dir,
@@ -452,7 +615,7 @@ impl GitBackend {
             extra_metadata_store: Arc::new(extra_metadata_store),
             cached_extra_metadata: Arc::new(Mutex::new(None)),
             write_batch_state: Arc::new(Mutex::new(GitWriteBatchState::default())),
-            written_objects: Arc::new(Mutex::new(HashSet::new())),
+            written_objects: Arc::new(GitObjectWriteTracker::default()),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
         }
@@ -894,26 +1057,22 @@ impl GitBackend {
 
 fn write_object_with_known_id_on_pool(
     objects_dir: &Path,
-    written_objects: &Mutex<HashSet<gix::hash::ObjectId>>,
+    written_objects: &GitObjectWriteTracker,
     write_repos: &GitWriteRepoPool,
     kind: gix::objs::Kind,
     bytes: &[u8],
     oid: gix::hash::ObjectId,
     object_type: &'static str,
 ) -> BackendResult<()> {
-    if written_objects.lock().unwrap().contains(&oid) {
-        return Ok(());
-    }
-    // Avoid recompressing loose objects that are already present. Packed objects
-    // are intentionally not checked here; finding those would require an ODB lookup.
-    if loose_object_path(objects_dir, &oid).is_file() {
-        written_objects.lock().unwrap().insert(oid);
-        return Ok(());
-    }
-    write_repos
-        .with_repo(|repo| write_object_with_known_id(repo, kind, bytes, oid, object_type))?;
-    written_objects.lock().unwrap().insert(oid);
-    Ok(())
+    written_objects.write_once(oid, || {
+        // Avoid recompressing loose objects that are already present. Packed objects
+        // are intentionally not checked here; finding those would require an ODB lookup.
+        if loose_object_path(objects_dir, &oid).is_file() {
+            return Ok(());
+        }
+        write_repos
+            .with_repo(|repo| write_object_with_known_id(repo, kind, bytes, oid, object_type))
+    })
 }
 
 fn loose_object_path(objects_dir: &Path, oid: &gix::hash::oid) -> PathBuf {
@@ -1530,6 +1689,10 @@ impl Backend for GitBackend {
         Ok(Box::pin(Cursor::new(data)))
     }
 
+    async fn read_file_bytes(&self, _path: &RepoPath, id: &FileId) -> BackendResult<Vec<u8>> {
+        self.read_file_sync(id)
+    }
+
     async fn write_file(
         &self,
         _path: &RepoPath,
@@ -1539,6 +1702,11 @@ impl Backend for GitBackend {
         contents.read_to_end(&mut bytes).await.unwrap();
 
         let oid = self.write_blob(&bytes, "file")?;
+        Ok(FileId::new(oid.as_bytes().to_vec()))
+    }
+
+    async fn write_file_bytes(&self, _path: &RepoPath, contents: &[u8]) -> BackendResult<FileId> {
+        let oid = self.write_blob(contents, "file")?;
         Ok(FileId::new(oid.as_bytes().to_vec()))
     }
 
@@ -2147,6 +2315,82 @@ mod tests {
         expected.extend_from_slice(&[1; SHA1_LENGTH]);
         assert_eq!(bytes, expected);
         Ok(())
+    }
+
+    #[test]
+    fn git_object_cache_is_shared_between_handles() {
+        let shards = new_git_object_cache();
+        let mut first = SharedGitObjectCache {
+            shards: shards.clone(),
+        };
+        let mut second = SharedGitObjectCache { shards };
+        let id = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+
+        gix::odb::pack::cache::Object::put(&mut first, id, gix::objs::Kind::Tree, b"tree");
+        let mut out = Vec::new();
+        let kind = gix::odb::pack::cache::Object::get(&mut second, &id, &mut out);
+
+        assert_eq!(kind, Some(gix::objs::Kind::Tree));
+        assert_eq!(out, b"tree");
+    }
+
+    #[test]
+    fn git_pack_cache_is_shared_between_handles() {
+        let shards = new_git_pack_cache();
+        let mut first = SharedGitPackCache {
+            shards: shards.clone(),
+        };
+        let mut second = SharedGitPackCache { shards };
+
+        gix::odb::pack::cache::DecodeEntry::put(
+            &mut first,
+            1,
+            42,
+            b"base",
+            gix::objs::Kind::Tree,
+            3,
+        );
+        let mut out = Vec::new();
+        let metadata = gix::odb::pack::cache::DecodeEntry::get(&mut second, 1, 42, &mut out);
+
+        assert_eq!(metadata, Some((gix::objs::Kind::Tree, 3)));
+        assert_eq!(out, b"base");
+    }
+
+    #[test]
+    fn concurrent_git_object_writes_are_deduplicated() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::thread;
+        use std::time::Duration;
+
+        let tracker = Arc::new(GitObjectWriteTracker::default());
+        let barrier = Arc::new(Barrier::new(4));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let id = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let tracker = tracker.clone();
+                let barrier = barrier.clone();
+                let writes = writes.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    tracker
+                        .write_once(id, || {
+                            writes.fetch_add(1, Ordering::Relaxed);
+                            thread::sleep(Duration::from_millis(20));
+                            Ok(())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
     }
 
     fn git_init(directory: impl AsRef<Path>, object_hash: gix::hash::Kind) -> gix::Repository {

@@ -14,8 +14,10 @@
 
 #![expect(missing_docs)]
 
+use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use clru::CLruCache;
+use clru::CLruCacheConfig;
+use clru::WeightScale;
 use futures::AsyncRead;
 use futures::stream::BoxStream;
 use pollster::FutureExt as _;
@@ -41,6 +45,7 @@ use crate::commit::Commit;
 use crate::index::Index;
 use crate::merge::Merge;
 use crate::merged_tree::MergedTree;
+use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::signing::Signer;
@@ -50,9 +55,24 @@ use crate::tree_merge::MergeOptions;
 // There are more tree objects than commits, and trees are often shared across
 // commits.
 pub(crate) const COMMIT_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(100).unwrap();
-// Large rebases revisit trees across many generations. Keep enough parsed trees
-// around that those reads don't fall back to the Git object database again.
-const TREE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+// Large rebases revisit trees across many generations. Bound the cache by memory
+// instead of object count because tree sizes vary by orders of magnitude.
+const TREE_CACHE_CAPACITY_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct TreeCacheWeight;
+
+impl WeightScale<TreeId, Arc<backend::Tree>> for TreeCacheWeight {
+    fn weight(&self, key: &TreeId, value: &Arc<backend::Tree>) -> usize {
+        mem::size_of::<TreeId>()
+            + key.as_bytes().len()
+            + mem::size_of::<Arc<backend::Tree>>()
+            + 2 * mem::size_of::<usize>()
+            + value.estimated_size_bytes()
+    }
+}
+
+type TreeCache = CLruCache<TreeId, Arc<backend::Tree>, RandomState, TreeCacheWeight>;
 
 /// Wraps the low-level backend and makes it return more convenient types. Also
 /// adds caching.
@@ -60,7 +80,7 @@ pub struct Store {
     backend: Box<dyn Backend>,
     signer: Signer,
     commit_cache: Mutex<CLruCache<CommitId, Arc<backend::Commit>>>,
-    tree_cache: Mutex<CLruCache<TreeId, Arc<backend::Tree>>>,
+    tree_cache: Mutex<TreeCache>,
     merge_options: MergeOptions,
 }
 
@@ -82,7 +102,10 @@ impl Store {
             backend,
             signer,
             commit_cache: Mutex::new(CLruCache::new(COMMIT_CACHE_CAPACITY)),
-            tree_cache: Mutex::new(CLruCache::new(TREE_CACHE_CAPACITY)),
+            tree_cache: Mutex::new(CLruCache::with_config(
+                CLruCacheConfig::new(NonZeroUsize::new(TREE_CACHE_CAPACITY_BYTES).unwrap())
+                    .with_scale(TreeCacheWeight),
+            )),
             merge_options,
         })
     }
@@ -210,7 +233,7 @@ impl Store {
         let data = self.backend.read_tree(dir, id).await?;
         let data = Arc::new(data);
         let mut locked_cache = self.tree_cache.lock().unwrap();
-        locked_cache.put(id.clone(), data.clone());
+        drop(locked_cache.put_with_weight(id.clone(), data.clone()));
         Ok(data)
     }
 
@@ -223,7 +246,7 @@ impl Store {
         let data = Arc::new(tree);
         {
             let mut locked_cache = self.tree_cache.lock().unwrap();
-            locked_cache.put(tree_id.clone(), data.clone());
+            drop(locked_cache.put_with_weight(tree_id.clone(), data.clone()));
         }
 
         Ok(Tree::new(self.clone(), path.to_owned(), tree_id, data))
@@ -237,12 +260,24 @@ impl Store {
         self.backend.read_file(path, id).await
     }
 
+    pub async fn read_file_bytes(&self, path: &RepoPath, id: &FileId) -> BackendResult<Vec<u8>> {
+        self.backend.read_file_bytes(path, id).await
+    }
+
     pub async fn write_file(
         &self,
         path: &RepoPath,
         contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId> {
         self.backend.write_file(path, contents).await
+    }
+
+    pub async fn write_file_bytes(
+        &self,
+        path: &RepoPath,
+        contents: &[u8],
+    ) -> BackendResult<FileId> {
+        self.backend.write_file_bytes(path, contents).await
     }
 
     pub async fn read_symlink(&self, path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {

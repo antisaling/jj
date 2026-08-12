@@ -176,7 +176,7 @@ impl MergedTree {
         let (simplified_labels, simplified) = if merged.is_resolved() {
             (ConflictLabels::unlabeled(), merged)
         } else {
-            self.labels.simplify_with(&merged)
+            self.labels.simplify_with_hash(&merged)
         };
         // If debug assertions are enabled, check that the merge was idempotent. In
         // particular, that this last simplification doesn't enable further automatic
@@ -360,7 +360,7 @@ impl MergedTree {
             .into_map(|(tree, _label)| tree.into_tree_ids())
             .flatten();
 
-        let (labels, tree_ids) = flattened_labels.simplify_with(&flattened_tree_ids);
+        let (labels, tree_ids) = flattened_labels.simplify_with_hash(&flattened_tree_ids);
         Self::new(store, tree_ids, labels)
     }
 }

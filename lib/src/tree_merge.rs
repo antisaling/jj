@@ -21,7 +21,6 @@ use std::iter::zip;
 use std::sync::Arc;
 use std::vec;
 
-use futures::AsyncReadExt as _;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
@@ -30,7 +29,6 @@ use futures::stream::FuturesUnordered;
 use itertools::Itertools as _;
 
 use crate::backend;
-use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::MergedTreeVal;
 use crate::backend::MergedTreeValue;
@@ -43,7 +41,6 @@ use crate::files::FileMergeHunkLevel;
 use crate::merge::Merge;
 use crate::merge::SameChange;
 use crate::merged_tree::all_merged_tree_entries;
-use crate::object_id::ObjectId as _;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponentBuf;
@@ -470,7 +467,7 @@ async fn try_resolve_file_values<T: Borrow<TreeValue>>(
     // trees), so we need to simplify them first.
     let simplified = values
         .map(|value| value.as_ref().map(Borrow::borrow))
-        .simplify();
+        .simplify_with_hash();
     // No fast path for simplified.is_resolved(). If it could be resolved, it would
     // have been caught by values.resolve_trivial() above.
     if let Some(resolved) = try_resolve_file_conflict(store, path, &simplified).await? {
@@ -551,27 +548,13 @@ async fn try_resolve_file_conflict(
     // 1. Avoid reading unchanged file contents
     // 2. The simplified conflict can sometimes be resolved when the unsimplfied one
     //    cannot
-    let file_id_conflict = file_id_conflict.simplify();
+    let file_id_conflict = file_id_conflict.simplify_with_hash();
 
     let contents = file_id_conflict
-        .try_map_async(async |file_id| {
-            let mut content = vec![];
-            let mut reader = store.read_file(filename, file_id).await?;
-            reader
-                .read_to_end(&mut content)
-                .await
-                .map_err(|err| BackendError::ReadObject {
-                    object_type: file_id.object_type(),
-                    hash: file_id.hex(),
-                    source: err.into(),
-                })?;
-            BackendResult::Ok(content)
-        })
+        .try_map_async(async |file_id| store.read_file_bytes(filename, file_id).await)
         .await?;
     if let Some(merged_content) = files::try_merge(&contents, options) {
-        let id = store
-            .write_file(filename, &mut merged_content.as_slice())
-            .await?;
+        let id = store.write_file_bytes(filename, &merged_content).await?;
         Ok(Some(TreeValue::File {
             id,
             executable,

@@ -27,6 +27,8 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use chrono::TimeZone as _;
 use futures::AsyncRead;
+use futures::AsyncReadExt as _;
+use futures::io::Cursor;
 use futures::stream::BoxStream;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -684,6 +686,26 @@ impl Tree {
         Self { entries }
     }
 
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<(RepoPathComponentBuf, TreeValue)>()
+            + self
+                .entries
+                .iter()
+                .map(|(name, value)| {
+                    name.heap_size_bytes()
+                        + match value {
+                            TreeValue::File { id, copy_id, .. } => {
+                                id.as_bytes().len() + copy_id.as_bytes().len()
+                            }
+                            TreeValue::Symlink(id) => id.as_bytes().len(),
+                            TreeValue::Tree(id) => id.as_bytes().len(),
+                            TreeValue::GitSubmodule(id) => id.as_bytes().len(),
+                        }
+                })
+                .sum::<usize>()
+    }
+
     /// Checks if this tree has no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -785,6 +807,24 @@ pub trait Backend: Any + Send + Sync + Debug {
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>>;
 
+    /// Reads the complete contents of a file into memory.
+    ///
+    /// Backends that already materialize files as byte buffers should override
+    /// this method to avoid copying the buffer through [`Self::read_file`].
+    async fn read_file_bytes(&self, path: &RepoPath, id: &FileId) -> BackendResult<Vec<u8>> {
+        let mut reader = self.read_file(path, id).await?;
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|err| BackendError::ReadObject {
+                object_type: id.object_type(),
+                hash: id.hex(),
+                source: err.into(),
+            })?;
+        Ok(bytes)
+    }
+
     /// Writes the contents of the writer to the backend. Returns the ID of the
     /// written file.
     async fn write_file(
@@ -792,6 +832,14 @@ pub trait Backend: Any + Send + Sync + Debug {
         path: &RepoPath,
         contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId>;
+
+    /// Writes complete file contents from memory.
+    ///
+    /// Backends that consume a byte buffer should override this method to avoid
+    /// copying the buffer through [`Self::write_file`].
+    async fn write_file_bytes(&self, path: &RepoPath, contents: &[u8]) -> BackendResult<FileId> {
+        self.write_file(path, &mut Cursor::new(contents)).await
+    }
 
     /// Reads the target of a symlink from the backend. Returns the target path.
     /// It is not a `RepoPath` because it doesn't necessarily point within the

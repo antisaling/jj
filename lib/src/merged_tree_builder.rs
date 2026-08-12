@@ -70,7 +70,7 @@ impl MergedTreeBuilder {
             // originating from a different tree than the base tree.
             ConflictLabels::unlabeled()
         };
-        let (labels, new_tree_ids) = labels.simplify_with(&new_tree_ids);
+        let (labels, new_tree_ids) = labels.simplify_with_hash(&new_tree_ids);
         match new_tree_ids.into_resolved() {
             Ok(single_tree_id) => Ok(MergedTree::resolved(store, single_tree_id)),
             Err(tree_ids) => {
