@@ -394,8 +394,13 @@ impl<'repo> CommitRewriter<'repo> {
             let new_base_tree_fut = merge_commit_trees(self.mut_repo, &new_parents);
             let old_tree = self.old_commit.tree();
             let (old_base_tree, new_base_tree) = try_join!(old_base_tree_fut, new_base_tree_fut)?;
-            (
-                old_base_tree.tree_ids() == self.old_commit.tree_ids(),
+            let was_empty = old_base_tree.tree_ids() == self.old_commit.tree_ids();
+            let new_tree = if old_base_tree.tree_ids_and_labels() == old_tree.tree_ids_and_labels()
+            {
+                // Optimization: An empty commit has no changes to merge. Preserve the
+                // destination tree and avoid recursively reading and writing all trees.
+                new_base_tree
+            } else {
                 MergedTree::merge(Merge::from_vec(vec![
                     (
                         new_base_tree,
@@ -416,8 +421,9 @@ impl<'repo> CommitRewriter<'repo> {
                         format!("{} (rebased revision)", self.old_commit.conflict_label()),
                     ),
                 ]))
-                .await?,
-            )
+                .await?
+            };
+            (was_empty, new_tree)
         };
         // Ensure we don't abandon commits with multiple parents (merge commits), even
         // if they're empty.

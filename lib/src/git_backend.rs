@@ -40,7 +40,6 @@ use futures::io::Cursor;
 use futures::stream::BoxStream;
 use gix::bstr::BString;
 use gix::objs::CommitRefIter;
-use gix::objs::Exists as _;
 use gix::objs::Write as _;
 use gix::objs::WriteTo as _;
 use gix::objs::commit::signature_field_name;
@@ -320,14 +319,18 @@ impl GitBackend {
         extra_metadata_store: TableStore,
         git_settings: GitSettings,
     ) -> Self {
-        let repo = base_repo.to_thread_local();
+        let mut repo = base_repo.to_thread_local();
+        // Rebase writes many objects that are intentionally not in the ODB yet.
+        // Don't rescan the ODB from disk after every expected miss.
+        repo.objects.refresh_never();
         let root_commit_id = CommitId::from_bytes(repo.object_hash().null_ref().as_bytes());
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id =
             TreeId::from_bytes(gix::ObjectId::empty_tree(repo.object_hash()).as_bytes());
+        let repo = Mutex::new(repo);
         Self {
             base_repo,
-            repo: Mutex::new(repo),
+            repo,
             root_commit_id,
             root_change_id,
             empty_tree_id,
@@ -735,7 +738,7 @@ impl GitBackend {
     }
 
     // Similar to gix's write_blob, but compute the hash outside our lock to
-    // reduce contention.
+    // reduce contention and pass the known ID to avoid hashing again.
     fn write_blob(
         &self,
         bytes: &[u8],
@@ -752,19 +755,46 @@ impl GitBackend {
         })?;
 
         let locked_repo = self.lock_git_repo();
-        if !locked_repo.objects.exists(&oid) {
-            // reuse the precomputed hash, since Gitoxide provides an API for it (otherwise
-            // Gitoxide recomputes it).
-            let write_oid = locked_repo
-                .objects
-                .write_buf_with_known_id(gix::objs::Kind::Blob, bytes, oid)
-                .map_err(|err| BackendError::WriteObject {
-                    object_type,
-                    source: err,
-                })?;
-            assert!(oid == write_oid);
-        }
+        write_object_with_known_id(&locked_repo, gix::objs::Kind::Blob, bytes, oid, object_type)?;
         Ok(oid)
+    }
+}
+
+fn write_object_with_known_id(
+    repo: &gix::Repository,
+    kind: gix::objs::Kind,
+    bytes: &[u8],
+    oid: gix::hash::ObjectId,
+    object_type: &'static str,
+) -> BackendResult<()> {
+    // The object ID was computed from `kind` and `bytes`, so checking the ODB first is
+    // unnecessary. Writing the same loose object again is harmless, and avoids a costly
+    // pack/loose lookup for every object produced during a rebase.
+    match repo.objects.write_buf_with_known_id(kind, bytes, oid) {
+        Ok(write_oid) => {
+            assert_eq!(oid, write_oid);
+            Ok(())
+        }
+        Err(err) if is_already_exists_error(err.as_ref()) => Ok(()),
+        Err(err) => Err(BackendError::WriteObject {
+            object_type,
+            source: err,
+        }),
+    }
+}
+
+fn is_already_exists_error(mut err: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::AlreadyExists)
+        {
+            return true;
+        }
+        let Some(source) = err.source() else {
+            return false;
+        };
+        err = source;
     }
 }
 
@@ -1433,13 +1463,26 @@ impl Backend for GitBackend {
             })
             .sorted_unstable()
             .collect();
-        let locked_repo = self.lock_git_repo();
-        let oid = locked_repo
-            .write_object(gix::objs::Tree { entries })
+        // Serialize and hash outside the repository lock. gix's `write_object()` does both
+        // while holding the lock and hashes the serialized object again before writing it.
+        let tree = gix::objs::Tree { entries };
+        let mut bytes = Vec::with_capacity(tree.size() as usize);
+        tree.write_to(&mut bytes)
             .map_err(|err| BackendError::WriteObject {
                 object_type: "tree",
                 source: Box::new(err),
             })?;
+        let oid = gix::objs::compute_hash(
+            self.base_repo.objects.object_hash(),
+            gix::objs::Kind::Tree,
+            &bytes,
+        )
+        .map_err(|err| BackendError::WriteObject {
+            object_type: "tree",
+            source: Box::new(err),
+        })?;
+        let locked_repo = self.lock_git_repo();
+        write_object_with_known_id(&locked_repo, gix::objs::Kind::Tree, &bytes, oid, "tree")?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
     }
 
