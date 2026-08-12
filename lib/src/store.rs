@@ -252,6 +252,25 @@ impl Store {
         Ok(Tree::new(self.clone(), path.to_owned(), tree_id, data))
     }
 
+    pub async fn write_trees(
+        self: &Arc<Self>,
+        path: &RepoPath,
+        trees: Vec<backend::Tree>,
+    ) -> BackendResult<Vec<Tree>> {
+        let tree_ids = self.backend.write_trees(path, &trees).await?;
+        assert_eq!(tree_ids.len(), trees.len());
+        let mut locked_cache = self.tree_cache.lock().unwrap();
+        Ok(tree_ids
+            .into_iter()
+            .zip(trees)
+            .map(|(tree_id, tree)| {
+                let data = Arc::new(tree);
+                drop(locked_cache.put_with_weight(tree_id.clone(), data.clone()));
+                Tree::new(self.clone(), path.to_owned(), tree_id, data)
+            })
+            .collect())
+    }
+
     pub async fn read_file(
         &self,
         path: &RepoPath,

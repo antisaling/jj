@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use chrono::TimeZone as _;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
+use futures::future::try_join_all;
 use futures::io::Cursor;
 use futures::stream::BoxStream;
 use smallvec::SmallVec;
@@ -880,6 +881,20 @@ pub trait Backend: Any + Send + Sync + Debug {
     /// Writes the given tree at the given path to the backend and returns its
     /// ID.
     async fn write_tree(&self, path: &RepoPath, contents: &Tree) -> BackendResult<TreeId>;
+
+    /// Writes the given trees at the same path to the backend and returns their
+    /// IDs in input order.
+    ///
+    /// Backends that can batch or parallelize tree writes should override this
+    /// method.
+    async fn write_trees(&self, path: &RepoPath, contents: &[Tree]) -> BackendResult<Vec<TreeId>> {
+        try_join_all(
+            contents
+                .iter()
+                .map(|contents| self.write_tree(path, contents)),
+        )
+        .await
+    }
 
     /// Reads the commit with the given ID.
     async fn read_commit(&self, id: &CommitId) -> BackendResult<Commit>;

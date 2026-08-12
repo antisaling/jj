@@ -183,6 +183,10 @@ impl Backend for SecretBackend {
         self.inner.write_tree(path, contents).await
     }
 
+    async fn write_trees(&self, path: &RepoPath, contents: &[Tree]) -> BackendResult<Vec<TreeId>> {
+        self.inner.write_trees(path, contents).await
+    }
+
     async fn read_commit(&self, id: &CommitId) -> BackendResult<Commit> {
         self.inner.read_commit(id).await
     }

@@ -24,7 +24,6 @@ use ahash::AHashMap;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
-use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
 use itertools::Itertools as _;
 
@@ -407,20 +406,28 @@ async fn write_trees(
 ) -> BackendResult<Merge<Tree>> {
     // Reuse an input tree when the merge produced identical contents. The merge tracks this
     // while it is already walking entries, avoiding another deep tree comparison here.
-    let trees = try_join_all(backend_trees.into_iter().zip(reusable_trees).map(
-        |(backend_tree, reusable_tree)| {
-            let store = store.clone();
-            let dir = dir.clone();
-            async move {
-                if let Some(tree) = reusable_tree {
-                    Ok(tree)
-                } else {
-                    store.write_tree(&dir, backend_tree).await
-                }
+    let mut trees = Vec::with_capacity(backend_trees.num_sides());
+    let mut backend_trees_to_write = Vec::new();
+    for (backend_tree, reusable_tree) in backend_trees.into_iter().zip(reusable_trees) {
+        match reusable_tree {
+            Some(tree) => trees.push(Some(tree)),
+            None => {
+                trees.push(None);
+                backend_trees_to_write.push(backend_tree);
             }
-        },
-    ))
-    .await?;
+        }
+    }
+    let mut written_trees = store
+        .write_trees(&dir, backend_trees_to_write)
+        .await?
+        .into_iter();
+    for tree in &mut trees {
+        if tree.is_none() {
+            *tree = Some(written_trees.next().unwrap());
+        }
+    }
+    debug_assert!(written_trees.next().is_none());
+    let trees: Vec<_> = trees.into_iter().map(Option::unwrap).collect();
     Ok(Merge::from_vec(trees))
 }
 

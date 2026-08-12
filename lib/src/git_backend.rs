@@ -52,6 +52,8 @@ use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
 use prost::Message as _;
+use rayon::iter::IntoParallelIterator as _;
+use rayon::prelude::ParallelIterator as _;
 #[cfg(not(target_vendor = "apple"))]
 use sha1::Digest as _;
 use smallvec::SmallVec;
@@ -433,6 +435,60 @@ fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>>
         bytes.extend_from_slice(entry.oid);
     }
     Ok(bytes)
+}
+
+fn serialize_and_hash_git_tree(contents: &Tree) -> BackendResult<(Vec<u8>, gix::hash::ObjectId)> {
+    let entries = contents
+        .entries()
+        .map(|entry| match entry.value() {
+            TreeValue::File {
+                id,
+                executable: false,
+                copy_id: _, // TODO: Use the value
+            } => GitTreeEntry {
+                name: entry.name().as_internal_str().as_bytes(),
+                mode: b"100644",
+                oid: id.as_bytes(),
+                is_tree: false,
+            },
+            TreeValue::File {
+                id,
+                executable: true,
+                copy_id: _, // TODO: Use the value
+            } => GitTreeEntry {
+                name: entry.name().as_internal_str().as_bytes(),
+                mode: b"100755",
+                oid: id.as_bytes(),
+                is_tree: false,
+            },
+            TreeValue::Symlink(id) => GitTreeEntry {
+                name: entry.name().as_internal_str().as_bytes(),
+                mode: b"120000",
+                oid: id.as_bytes(),
+                is_tree: false,
+            },
+            TreeValue::Tree(id) => GitTreeEntry {
+                name: entry.name().as_internal_str().as_bytes(),
+                mode: b"40000",
+                oid: id.as_bytes(),
+                is_tree: true,
+            },
+            TreeValue::GitSubmodule(id) => GitTreeEntry {
+                name: entry.name().as_internal_str().as_bytes(),
+                mode: b"160000",
+                oid: id.as_bytes(),
+                is_tree: false,
+            },
+        })
+        .collect();
+    // Serialize and hash outside the repository lock. gix's `write_object()` does both
+    // while holding the lock and hashes the serialized object again before writing it.
+    let bytes = serialize_git_tree(entries).map_err(|err| BackendError::WriteObject {
+        object_type: "tree",
+        source: Box::new(err),
+    })?;
+    let oid = compute_synthesized_tree_hash(&bytes);
+    Ok((bytes, oid))
 }
 
 impl GitReadRepoPool {
@@ -2436,58 +2492,7 @@ impl Backend for GitBackend {
     }
 
     async fn write_tree(&self, _path: &RepoPath, contents: &Tree) -> BackendResult<TreeId> {
-        let entries = contents
-            .entries()
-            .map(|entry| {
-                match entry.value() {
-                    TreeValue::File {
-                        id,
-                        executable: false,
-                        copy_id: _, // TODO: Use the value
-                    } => GitTreeEntry {
-                        name: entry.name().as_internal_str().as_bytes(),
-                        mode: b"100644",
-                        oid: id.as_bytes(),
-                        is_tree: false,
-                    },
-                    TreeValue::File {
-                        id,
-                        executable: true,
-                        copy_id: _, // TODO: Use the value
-                    } => GitTreeEntry {
-                        name: entry.name().as_internal_str().as_bytes(),
-                        mode: b"100755",
-                        oid: id.as_bytes(),
-                        is_tree: false,
-                    },
-                    TreeValue::Symlink(id) => GitTreeEntry {
-                        name: entry.name().as_internal_str().as_bytes(),
-                        mode: b"120000",
-                        oid: id.as_bytes(),
-                        is_tree: false,
-                    },
-                    TreeValue::Tree(id) => GitTreeEntry {
-                        name: entry.name().as_internal_str().as_bytes(),
-                        mode: b"40000",
-                        oid: id.as_bytes(),
-                        is_tree: true,
-                    },
-                    TreeValue::GitSubmodule(id) => GitTreeEntry {
-                        name: entry.name().as_internal_str().as_bytes(),
-                        mode: b"160000",
-                        oid: id.as_bytes(),
-                        is_tree: false,
-                    },
-                }
-            })
-            .collect();
-        // Serialize and hash outside the repository lock. gix's `write_object()` does both
-        // while holding the lock and hashes the serialized object again before writing it.
-        let bytes = serialize_git_tree(entries).map_err(|err| BackendError::WriteObject {
-            object_type: "tree",
-            source: Box::new(err),
-        })?;
-        let oid = compute_synthesized_tree_hash(&bytes);
+        let (bytes, oid) = serialize_and_hash_git_tree(contents)?;
         let write_result = if rayon::current_thread_index().is_some() {
             write_or_buffer_object_on_pool(
                 &self.objects_dir,
@@ -2529,6 +2534,27 @@ impl Backend for GitBackend {
         };
         write_result?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
+    }
+
+    async fn write_trees(&self, _path: &RepoPath, contents: &[Tree]) -> BackendResult<Vec<TreeId>> {
+        contents
+            .into_par_iter()
+            .map(|contents| {
+                let (bytes, oid) = serialize_and_hash_git_tree(contents)?;
+                write_or_buffer_object_on_pool(
+                    &self.objects_dir,
+                    &self.written_objects,
+                    &self.write_repos,
+                    &self.write_batch_state,
+                    &self.buffered_objects,
+                    gix::objs::Kind::Tree,
+                    bytes,
+                    oid,
+                    "tree",
+                )?;
+                Ok(TreeId::from_bytes(oid.as_bytes()))
+            })
+            .collect()
     }
 
     #[tracing::instrument(skip(self))]
@@ -3105,6 +3131,60 @@ mod tests {
             compute_synthesized_tree_hash(&[]),
             gix::ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn write_trees_preserves_order_and_batch_durability() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path);
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        let write_batch = backend.start_write_batch();
+        let mut trees = Vec::new();
+        for i in 0..16 {
+            let file_id = backend
+                .write_file_bytes(RepoPath::root(), format!("content {i}").as_bytes())
+                .block_on()?;
+            trees.push(Tree::from_sorted_entries(vec![(
+                RepoPathComponentBuf::new(format!("file{i}"))?,
+                TreeValue::File {
+                    id: file_id,
+                    executable: false,
+                    copy_id: CopyId::placeholder(),
+                },
+            )]));
+        }
+        let expected_ids = trees
+            .iter()
+            .map(|tree| {
+                let (_, oid) = serialize_and_hash_git_tree(tree)?;
+                Ok(TreeId::from_bytes(oid.as_bytes()))
+            })
+            .collect::<BackendResult<Vec<_>>>()?;
+        let tree_ids = backend.write_trees(RepoPath::root(), &trees).block_on()?;
+        assert_eq!(tree_ids, expected_ids);
+        for (tree_id, tree) in tree_ids.iter().zip(&trees) {
+            assert_eq!(
+                backend.read_tree(RepoPath::root(), tree_id).block_on()?,
+                *tree
+            );
+        }
+        write_batch.finish()?;
+
+        let reopened_backend = GitBackend::load(&settings, &store_path)?;
+        for (tree_id, tree) in tree_ids.iter().zip(trees) {
+            assert_eq!(
+                reopened_backend
+                    .read_tree(RepoPath::root(), tree_id)
+                    .block_on()?,
+                tree
+            );
+        }
         Ok(())
     }
 
