@@ -192,6 +192,7 @@ pub struct GitBackend {
     base_repo: gix::ThreadSafeRepository,
     objects_dir: PathBuf,
     repo: Mutex<gix::Repository>,
+    write_repos: Arc<GitRepoPool>,
     read_repos: Arc<GitReadRepoPool>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
@@ -200,12 +201,12 @@ pub struct GitBackend {
     extra_metadata_store: Arc<TableStore>,
     cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
     write_batch_state: Arc<Mutex<GitWriteBatchState>>,
-    written_objects: Mutex<HashSet<gix::hash::ObjectId>>,
+    written_objects: Arc<Mutex<HashSet<gix::hash::ObjectId>>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
 }
 
-struct GitReadRepoPool {
+struct GitRepoPool {
     repos: Vec<Mutex<gix::Repository>>,
     next: AtomicUsize,
 }
@@ -251,13 +252,15 @@ fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>>
     Ok(bytes)
 }
 
-impl GitReadRepoPool {
-    fn new(base_repo: &gix::ThreadSafeRepository) -> Self {
+impl GitRepoPool {
+    fn new(base_repo: &gix::ThreadSafeRepository, object_cache_size: Option<usize>) -> Self {
         let repos = (0..GIT_TREE_READ_CONCURRENCY)
             .map(|_| {
                 let mut repo = base_repo.to_thread_local();
                 repo.objects.refresh_never();
-                repo.object_cache_size(Some(GIT_OBJECT_CACHE_SIZE));
+                if let Some(object_cache_size) = object_cache_size {
+                    repo.object_cache_size(Some(object_cache_size));
+                }
                 Mutex::new(repo)
             })
             .collect();
@@ -273,6 +276,8 @@ impl GitReadRepoPool {
         f(&mut repo)
     }
 }
+
+type GitReadRepoPool = GitRepoPool;
 
 #[derive(Default)]
 struct GitWriteBatch {
@@ -407,12 +412,17 @@ impl GitBackend {
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id =
             TreeId::from_bytes(gix::ObjectId::empty_tree(repo.object_hash()).as_bytes());
-        let read_repos = Arc::new(GitReadRepoPool::new(&base_repo));
+        let write_repos = Arc::new(GitRepoPool::new(&base_repo, None));
+        let read_repos = Arc::new(GitReadRepoPool::new(
+            &base_repo,
+            Some(GIT_OBJECT_CACHE_SIZE),
+        ));
         let repo = Mutex::new(repo);
         Self {
             base_repo,
             objects_dir,
             repo,
+            write_repos,
             read_repos,
             root_commit_id,
             root_change_id,
@@ -421,7 +431,7 @@ impl GitBackend {
             extra_metadata_store: Arc::new(extra_metadata_store),
             cached_extra_metadata: Arc::new(Mutex::new(None)),
             write_batch_state: Arc::new(Mutex::new(GitWriteBatchState::default())),
-            written_objects: Mutex::new(HashSet::new()),
+            written_objects: Arc::new(Mutex::new(HashSet::new())),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
         }
@@ -849,21 +859,40 @@ impl GitBackend {
         oid: gix::hash::ObjectId,
         object_type: &'static str,
     ) -> BackendResult<()> {
-        let mut written_objects = self.written_objects.lock().unwrap();
-        if written_objects.contains(&oid) {
-            return Ok(());
-        }
-        // Avoid recompressing loose objects that are already present. Packed objects
-        // are intentionally not checked here; finding those would require an ODB lookup.
-        if loose_object_path(&self.objects_dir, &oid).is_file() {
-            written_objects.insert(oid);
-            return Ok(());
-        }
-        let locked_repo = self.lock_git_repo();
-        write_object_with_known_id(&locked_repo, kind, bytes, oid, object_type)?;
-        written_objects.insert(oid);
-        Ok(())
+        write_object_with_known_id_on_pool(
+            &self.objects_dir,
+            &self.written_objects,
+            &self.write_repos,
+            kind,
+            bytes,
+            oid,
+            object_type,
+        )
     }
+}
+
+fn write_object_with_known_id_on_pool(
+    objects_dir: &Path,
+    written_objects: &Mutex<HashSet<gix::hash::ObjectId>>,
+    write_repos: &GitRepoPool,
+    kind: gix::objs::Kind,
+    bytes: &[u8],
+    oid: gix::hash::ObjectId,
+    object_type: &'static str,
+) -> BackendResult<()> {
+    if written_objects.lock().unwrap().contains(&oid) {
+        return Ok(());
+    }
+    // Avoid recompressing loose objects that are already present. Packed objects
+    // are intentionally not checked here; finding those would require an ODB lookup.
+    if loose_object_path(objects_dir, &oid).is_file() {
+        written_objects.lock().unwrap().insert(oid);
+        return Ok(());
+    }
+    write_repos
+        .with_repo(|repo| write_object_with_known_id(repo, kind, bytes, oid, object_type))?;
+    written_objects.lock().unwrap().insert(oid);
+    Ok(())
 }
 
 fn loose_object_path(objects_dir: &Path, oid: &gix::hash::oid) -> PathBuf {
@@ -1621,7 +1650,40 @@ impl Backend for GitBackend {
             object_type: "tree",
             source: Box::new(err),
         })?;
-        self.write_object_with_known_id(gix::objs::Kind::Tree, &bytes, oid, "tree")?;
+        let write_result = if rayon::current_thread_index().is_some() {
+            write_object_with_known_id_on_pool(
+                &self.objects_dir,
+                &self.written_objects,
+                &self.write_repos,
+                gix::objs::Kind::Tree,
+                &bytes,
+                oid,
+                "tree",
+            )
+        } else {
+            let objects_dir = self.objects_dir.clone();
+            let written_objects = self.written_objects.clone();
+            let write_repos = self.write_repos.clone();
+            let (sender, receiver) = oneshot::channel();
+            rayon::spawn(move || {
+                let result = write_object_with_known_id_on_pool(
+                    &objects_dir,
+                    &written_objects,
+                    &write_repos,
+                    gix::objs::Kind::Tree,
+                    &bytes,
+                    oid,
+                    "tree",
+                );
+                drop(sender.send(result));
+            });
+            receiver.await.map_err(|_| {
+                BackendError::Other(Box::new(std::io::Error::other(
+                    "Git tree write task exited",
+                )))
+            })?
+        };
+        write_result?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
     }
 
