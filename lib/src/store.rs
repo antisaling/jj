@@ -50,7 +50,9 @@ use crate::tree_merge::MergeOptions;
 // There are more tree objects than commits, and trees are often shared across
 // commits.
 pub(crate) const COMMIT_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(100).unwrap();
-const TREE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+// Large rebases revisit trees across many generations. Keep enough parsed trees
+// around that those reads don't fall back to the Git object database again.
+const TREE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Wraps the low-level backend and makes it return more convenient types. Also
 /// adds caching.
