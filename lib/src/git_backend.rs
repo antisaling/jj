@@ -30,6 +30,8 @@ use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -97,6 +99,7 @@ use crate::stacked_table::TableStoreError;
 
 const CHANGE_ID_LENGTH: usize = 16;
 const GIT_TREE_READ_CONCURRENCY: usize = 4;
+const GIT_OBJECT_CACHE_SIZE: usize = 16 * 1024 * 1024;
 /// Ref namespace used only for preventing GC.
 const NO_GC_REF_NAMESPACE: &str = "refs/jj/keep/";
 
@@ -188,6 +191,7 @@ pub struct GitBackend {
     base_repo: gix::ThreadSafeRepository,
     objects_dir: PathBuf,
     repo: Mutex<gix::Repository>,
+    read_repos: Arc<GitReadRepoPool>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -198,6 +202,34 @@ pub struct GitBackend {
     written_objects: Mutex<HashSet<gix::hash::ObjectId>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
+}
+
+struct GitReadRepoPool {
+    repos: Vec<Mutex<gix::Repository>>,
+    next: AtomicUsize,
+}
+
+impl GitReadRepoPool {
+    fn new(base_repo: &gix::ThreadSafeRepository) -> Self {
+        let repos = (0..GIT_TREE_READ_CONCURRENCY)
+            .map(|_| {
+                let mut repo = base_repo.to_thread_local();
+                repo.objects.refresh_never();
+                repo.object_cache_size(Some(GIT_OBJECT_CACHE_SIZE));
+                Mutex::new(repo)
+            })
+            .collect();
+        Self {
+            repos,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_repo<T>(&self, f: impl FnOnce(&mut gix::Repository) -> T) -> T {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.repos.len();
+        let mut repo = self.repos[index].lock().unwrap();
+        f(&mut repo)
+    }
 }
 
 #[derive(Default)]
@@ -328,15 +360,18 @@ impl GitBackend {
         // Rebase writes many objects that are intentionally not in the ODB yet.
         // Don't rescan the ODB from disk after every expected miss.
         repo.objects.refresh_never();
+        repo.object_cache_size(Some(GIT_OBJECT_CACHE_SIZE));
         let root_commit_id = CommitId::from_bytes(repo.object_hash().null_ref().as_bytes());
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id =
             TreeId::from_bytes(gix::ObjectId::empty_tree(repo.object_hash()).as_bytes());
+        let read_repos = Arc::new(GitReadRepoPool::new(&base_repo));
         let repo = Mutex::new(repo);
         Self {
             base_repo,
             objects_dir,
             repo,
+            read_repos,
             root_commit_id,
             root_change_id,
             empty_tree_id,
@@ -1306,12 +1341,10 @@ impl Debug for GitBackend {
 }
 
 fn read_tree_from_git_repo(
-    base_repo: &gix::ThreadSafeRepository,
+    repo: &mut gix::Repository,
     id: &TreeId,
     git_tree_id: gix::ObjectId,
 ) -> BackendResult<Tree> {
-    let mut repo = base_repo.to_thread_local();
-    repo.objects.refresh_never();
     let git_tree = repo
         .find_object(git_tree_id)
         .map_err(|err| map_not_found_err(err, id))?
@@ -1461,9 +1494,10 @@ impl Backend for GitBackend {
         // those workers while waiting for another job on the same pool can
         // deadlock when all workers reach this path at once.
         if rayon::current_thread_index().is_some() {
-            let repo = self.base_repo.to_thread_local();
-            let git_tree_id = validate_git_object_id(&repo, id)?;
-            return read_tree_from_git_repo(&self.base_repo, id, git_tree_id);
+            return self.read_repos.with_repo(|repo| {
+                let git_tree_id = validate_git_object_id(repo, id)?;
+                read_tree_from_git_repo(repo, id, git_tree_id)
+            });
         }
 
         let git_tree_id = {
@@ -1471,11 +1505,12 @@ impl Backend for GitBackend {
             validate_git_object_id(&locked_repo, id)?
         };
 
-        let base_repo = self.base_repo.clone();
+        let read_repos = self.read_repos.clone();
         let id = id.clone();
         let (sender, receiver) = oneshot::channel();
         rayon::spawn(move || {
-            let result = read_tree_from_git_repo(&base_repo, &id, git_tree_id);
+            let result =
+                read_repos.with_repo(|repo| read_tree_from_git_repo(repo, &id, git_tree_id));
             drop(sender.send(result));
         });
         receiver.await.map_err(|_| {
