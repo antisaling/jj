@@ -22,7 +22,6 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use blake2::Blake2b512;
@@ -47,6 +46,7 @@ use crate::backend::CopyHistory;
 use crate::backend::CopyId;
 use crate::backend::CopyRecord;
 use crate::backend::FileId;
+use crate::backend::GcOptions;
 use crate::backend::MillisSinceEpoch;
 use crate::backend::RelatedCopy;
 use crate::backend::SecureSig;
@@ -347,7 +347,7 @@ impl Backend for SimpleBackend {
         Ok(stream::empty().boxed())
     }
 
-    fn gc(&self, _index: &dyn Index, _keep_newer: SystemTime) -> BackendResult<()> {
+    fn gc(&self, _index: &dyn Index, _options: GcOptions) -> BackendResult<()> {
         Ok(())
     }
 }

@@ -15,6 +15,7 @@
 #![expect(missing_docs)]
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -22,11 +23,13 @@ use std::fmt::Error;
 use std::fmt::Formatter;
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
 use std::process::ExitStatus;
+use std::process::Stdio;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -65,6 +68,7 @@ use crate::backend::CopyHistory;
 use crate::backend::CopyId;
 use crate::backend::CopyRecord;
 use crate::backend::FileId;
+use crate::backend::GcOptions;
 use crate::backend::MillisSinceEpoch;
 use crate::backend::RelatedCopy;
 use crate::backend::SecureSig;
@@ -203,6 +207,7 @@ pub struct GitBackend {
     extra_metadata_store: Arc<TableStore>,
     cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
     write_batch_state: Arc<Mutex<GitWriteBatchState>>,
+    buffered_objects: Arc<Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>>,
     written_objects: Arc<GitObjectWriteTracker>,
     git_executable: PathBuf,
     write_change_id_header: bool,
@@ -233,6 +238,15 @@ struct GitObjectWriteState {
     written: HashSet<gix::hash::ObjectId>,
     in_flight: HashSet<gix::hash::ObjectId>,
 }
+
+struct BufferedGitObject {
+    kind: gix::objs::Kind,
+    data: Vec<u8>,
+    compressed_data: Vec<u8>,
+}
+
+const MIN_BUFFERED_OBJECTS_PER_PACK: usize = 128;
+const GIT_OBJECT_STORE_LOCK_FILE: &str = "jj-object-store.lock";
 
 impl GitObjectWriteTracker {
     fn write_once(
@@ -467,6 +481,9 @@ impl GitWriteRepoPool {
 struct GitWriteBatch {
     table: Option<MutableTable>,
     table_lock: Option<FileLock>,
+    object_store_lock: Option<FileLock>,
+    object_ids: Vec<gix::hash::ObjectId>,
+    commit_ids: HashSet<CommitId>,
 }
 
 #[derive(Default)]
@@ -511,10 +528,24 @@ pub struct GitWriteBatchGuard {
     state: Arc<Mutex<GitWriteBatchState>>,
     extra_metadata_store: Arc<TableStore>,
     cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
+    buffered_objects: Arc<Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>>,
+    write_repos: Arc<GitWriteRepoPool>,
+    git_executable: PathBuf,
+    git_repo_path: PathBuf,
     finished: bool,
 }
 
 impl GitWriteBatch {
+    fn ensure_object_store_lock(&mut self, git_repo_path: &Path) -> BackendResult<()> {
+        if self.object_store_lock.is_none() {
+            self.object_store_lock = Some(
+                FileLock::lock(git_repo_path.join(GIT_OBJECT_STORE_LOCK_FILE))
+                    .map_err(|err| BackendError::Other(Box::new(err)))?,
+            );
+        }
+        Ok(())
+    }
+
     fn table<'a>(&'a mut self, backend: &GitBackend) -> BackendResult<&'a mut MutableTable> {
         if self.table.is_none() {
             let (table, table_lock) = backend.read_extra_metadata_table_locked()?;
@@ -524,25 +555,288 @@ impl GitWriteBatch {
         Ok(self.table.as_mut().unwrap())
     }
 
-    fn finish(
-        self,
+    fn flush(
+        &mut self,
         extra_metadata_store: &TableStore,
         cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
+        buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+        write_repos: &GitWriteRepoPool,
+        git_executable: &Path,
+        git_repo_path: &Path,
     ) -> BackendResult<()> {
-        let Some(mut_table) = self.table else {
+        if self.object_ids.is_empty() && self.commit_ids.is_empty() && self.table.is_none() {
             return Ok(());
-        };
-        let table_lock = self.table_lock.expect("metadata table lock missing");
-        let table = extra_metadata_store
-            .save_table(mut_table)
-            .map_err(GitBackendError::WriteMetadata)?;
-        *cached_extra_metadata.lock().unwrap() = Some(table);
-        drop(table_lock);
+        }
+        self.ensure_object_store_lock(git_repo_path)?;
+        flush_git_write_batch(
+            &self.object_ids,
+            &self.commit_ids,
+            buffered_objects,
+            write_repos,
+            git_executable,
+            git_repo_path,
+        )?;
+        if let Some(mut_table) = self.table.take() {
+            let table_lock = self.table_lock.take().expect("metadata table lock missing");
+            let table = extra_metadata_store
+                .save_table(mut_table)
+                .map_err(GitBackendError::WriteMetadata)?;
+            *cached_extra_metadata.lock().unwrap() = Some(table);
+            drop(table_lock);
+        }
+        self.object_ids.clear();
+        self.commit_ids.clear();
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        extra_metadata_store: &TableStore,
+        cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
+        buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+        write_repos: &GitWriteRepoPool,
+        git_executable: &Path,
+        git_repo_path: &Path,
+    ) -> BackendResult<()> {
+        self.flush(
+            extra_metadata_store,
+            cached_extra_metadata,
+            buffered_objects,
+            write_repos,
+            git_executable,
+            git_repo_path,
+        )?;
+        drop(self.object_store_lock.take());
         Ok(())
     }
 }
 
+struct PackHashWriter<W> {
+    inner: W,
+    hasher: Option<gix::hash::Hasher>,
+}
+
+impl<W: io::Write> PackHashWriter<W> {
+    fn new(inner: W, hash_kind: gix::hash::Kind) -> Self {
+        Self {
+            inner,
+            hasher: Some(gix::hash::hasher(hash_kind)),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<W> {
+        let digest = self
+            .hasher
+            .take()
+            .unwrap()
+            .try_finalize()
+            .map_err(io::Error::other)?;
+        self.inner.write_all(digest.as_bytes())?;
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: io::Write> io::Write for PackHashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.as_mut().unwrap().update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_pack_entry_header(
+    writer: &mut impl io::Write,
+    kind: gix::objs::Kind,
+    mut size: usize,
+) -> io::Result<()> {
+    let kind_bits = match kind {
+        gix::objs::Kind::Commit => 1,
+        gix::objs::Kind::Tree => 2,
+        gix::objs::Kind::Blob => 3,
+        gix::objs::Kind::Tag => 4,
+    };
+    let mut byte = ((kind_bits << 4) | (size & 0xf)) as u8;
+    size >>= 4;
+    while size != 0 {
+        writer.write_all(&[byte | 0x80])?;
+        byte = (size & 0x7f) as u8;
+        size >>= 7;
+    }
+    writer.write_all(&[byte])
+}
+
+fn write_buffered_git_pack(
+    objects: &[(gix::hash::ObjectId, Arc<BufferedGitObject>)],
+    git_executable: &Path,
+    git_repo_path: &Path,
+) -> BackendResult<()> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+    let object_count = u32::try_from(objects.len()).map_err(|err| BackendError::WriteObject {
+        object_type: "pack",
+        source: Box::new(err),
+    })?;
+    let mut child = Command::new(git_executable)
+        .arg("--git-dir=.")
+        .arg("index-pack")
+        .arg("--stdin")
+        .current_dir(git_repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| BackendError::WriteObject {
+            object_type: "pack",
+            source: Box::new(err),
+        })?;
+    let stdin = child.stdin.take().unwrap();
+    let mut writer = Some(PackHashWriter::new(
+        io::BufWriter::new(stdin),
+        objects[0].0.kind(),
+    ));
+    let write_result = (|| -> io::Result<()> {
+        let writer = writer.as_mut().unwrap();
+        writer.write_all(b"PACK")?;
+        writer.write_all(&2_u32.to_be_bytes())?;
+        writer.write_all(&object_count.to_be_bytes())?;
+        for (_id, object) in objects {
+            write_pack_entry_header(writer, object.kind, object.data.len())?;
+            writer.write_all(&object.compressed_data)?;
+        }
+        Ok(())
+    })();
+    let write_result = match write_result {
+        Ok(()) => writer.take().unwrap().finish().map(drop),
+        Err(err) => {
+            // Close the pipe so index-pack doesn't wait forever after a write error.
+            drop(writer.take());
+            Err(err)
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .map_err(|err| BackendError::WriteObject {
+            object_type: "pack",
+            source: Box::new(err),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(BackendError::WriteObject {
+            object_type: "pack",
+            source: io::Error::other(format!("git index-pack failed: {stderr}")).into(),
+        });
+    }
+    write_result.map_err(|err| BackendError::WriteObject {
+        object_type: "pack",
+        source: Box::new(err),
+    })
+}
+
+fn flush_buffered_git_objects(
+    object_ids: &[gix::hash::ObjectId],
+    buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+    write_repos: &GitWriteRepoPool,
+    git_executable: &Path,
+    git_repo_path: &Path,
+) -> BackendResult<()> {
+    let objects = {
+        let buffered_objects = buffered_objects.lock().unwrap();
+        object_ids
+            .iter()
+            .filter_map(|id| buffered_objects.get(id).map(|object| (*id, object.clone())))
+            .collect_vec()
+    };
+    if objects.len() < MIN_BUFFERED_OBJECTS_PER_PACK {
+        return write_buffered_git_objects_loose(&objects, write_repos);
+    }
+    if let Err(pack_err) = write_buffered_git_pack(&objects, git_executable, git_repo_path) {
+        // Preserve correctness if the batch writer fails. This is slower, but it
+        // leaves every object reachable by the already-committed operation in the ODB.
+        tracing::warn!(
+            ?pack_err,
+            "failed to write Git object pack; falling back to loose objects"
+        );
+        write_buffered_git_objects_loose(&objects, write_repos)?;
+    }
+    Ok(())
+}
+
+fn write_buffered_git_objects_loose(
+    objects: &[(gix::hash::ObjectId, Arc<BufferedGitObject>)],
+    write_repos: &GitWriteRepoPool,
+) -> BackendResult<()> {
+    for (id, object) in objects {
+        write_repos.with_repo(|repo| {
+            write_object_with_known_id(
+                repo,
+                object.kind,
+                &object.data,
+                *id,
+                object_kind_name(object.kind),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn flush_git_write_batch(
+    object_ids: &[gix::hash::ObjectId],
+    commit_ids: &HashSet<CommitId>,
+    buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+    write_repos: &GitWriteRepoPool,
+    git_executable: &Path,
+    git_repo_path: &Path,
+) -> BackendResult<()> {
+    flush_buffered_git_objects(
+        object_ids,
+        buffered_objects,
+        write_repos,
+        git_executable,
+        git_repo_path,
+    )?;
+    if !commit_ids.is_empty() {
+        write_repos.with_repo(|repo| {
+            repo.edit_references(commit_ids.iter().map(to_no_gc_ref_update))
+                .map_err(|err| BackendError::Other(Box::new(err)))
+        })?;
+    }
+    Ok(())
+}
+
+fn object_kind_name(kind: gix::objs::Kind) -> &'static str {
+    match kind {
+        gix::objs::Kind::Commit => "commit",
+        gix::objs::Kind::Tree => "tree",
+        gix::objs::Kind::Blob => "blob",
+        gix::objs::Kind::Tag => "tag",
+    }
+}
+
 impl GitWriteBatchGuard {
+    /// Makes the current batch durable without releasing the command-scoped
+    /// object-store lock. This must happen before publishing an operation that
+    /// references objects from the batch.
+    pub fn flush(&mut self) -> BackendResult<()> {
+        if self.finished {
+            return Ok(());
+        }
+        flush_active_git_write_batch(
+            &self.state,
+            &self.extra_metadata_store,
+            &self.cached_extra_metadata,
+            &self.buffered_objects,
+            &self.write_repos,
+            &self.git_executable,
+            &self.git_repo_path,
+        )
+    }
+
     fn finish_inner(&mut self) -> BackendResult<()> {
         if self.finished {
             return Ok(());
@@ -558,7 +852,14 @@ impl GitWriteBatchGuard {
             }
         };
         if let Some(batch) = batch {
-            batch.finish(&self.extra_metadata_store, &self.cached_extra_metadata)?;
+            batch.finish(
+                &self.extra_metadata_store,
+                &self.cached_extra_metadata,
+                &self.buffered_objects,
+                &self.write_repos,
+                &self.git_executable,
+                &self.git_repo_path,
+            )?;
         }
         Ok(())
     }
@@ -566,6 +867,29 @@ impl GitWriteBatchGuard {
     pub fn finish(mut self) -> BackendResult<()> {
         self.finish_inner()
     }
+}
+
+fn flush_active_git_write_batch(
+    state: &Mutex<GitWriteBatchState>,
+    extra_metadata_store: &TableStore,
+    cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
+    buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+    write_repos: &GitWriteRepoPool,
+    git_executable: &Path,
+    git_repo_path: &Path,
+) -> BackendResult<()> {
+    let mut state = state.lock().unwrap();
+    let Some(batch) = state.batch.as_mut() else {
+        return Ok(());
+    };
+    batch.flush(
+        extra_metadata_store,
+        cached_extra_metadata,
+        buffered_objects,
+        write_repos,
+        git_executable,
+        git_repo_path,
+    )
 }
 
 impl Drop for GitWriteBatchGuard {
@@ -615,6 +939,7 @@ impl GitBackend {
             extra_metadata_store: Arc::new(extra_metadata_store),
             cached_extra_metadata: Arc::new(Mutex::new(None)),
             write_batch_state: Arc::new(Mutex::new(GitWriteBatchState::default())),
+            buffered_objects: Arc::new(Mutex::new(HashMap::new())),
             written_objects: Arc::new(GitObjectWriteTracker::default()),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
@@ -632,8 +957,28 @@ impl GitBackend {
             state: self.write_batch_state.clone(),
             extra_metadata_store: self.extra_metadata_store.clone(),
             cached_extra_metadata: self.cached_extra_metadata.clone(),
+            buffered_objects: self.buffered_objects.clone(),
+            write_repos: self.write_repos.clone(),
+            git_executable: self.git_executable.clone(),
+            git_repo_path: self.git_repo_path().to_owned(),
             finished: false,
         }
+    }
+
+    fn git_object_store_lock_path(&self) -> PathBuf {
+        self.git_repo_path().join(GIT_OBJECT_STORE_LOCK_FILE)
+    }
+
+    fn flush_active_write_batch(&self) -> BackendResult<()> {
+        flush_active_git_write_batch(
+            &self.write_batch_state,
+            &self.extra_metadata_store,
+            &self.cached_extra_metadata,
+            &self.buffered_objects,
+            &self.write_repos,
+            &self.git_executable,
+            self.git_repo_path(),
+        )
     }
 
     pub fn init_internal(
@@ -925,9 +1270,10 @@ impl GitBackend {
         if let Some(batch) = write_batch_state.batch.as_mut() {
             // Reuse the command-scoped table and lock if a read discovers a Git
             // commit that hasn't been imported yet.
-            locked_repo
-                .edit_references(head_ids.iter().copied().map(to_no_gc_ref_update))
-                .map_err(|err| BackendError::Other(Box::new(err)))?;
+            batch.ensure_object_store_lock(self.git_repo_path())?;
+            batch
+                .commit_ids
+                .extend(head_ids.iter().map(|id| (*id).clone()));
             let table = batch.table(self)?;
             import_extra_metadata_entries_from_heads(
                 &locked_repo,
@@ -963,8 +1309,26 @@ impl GitBackend {
     }
 
     fn read_file_sync(&self, id: &FileId) -> BackendResult<Vec<u8>> {
+        let git_blob_id = validate_git_object_id_kind(self.base_repo.objects.object_hash(), id)?;
+        let buffered_object = self
+            .buffered_objects
+            .lock()
+            .unwrap()
+            .get(&git_blob_id)
+            .cloned();
+        if let Some(object) = buffered_object {
+            if object.kind != gix::objs::Kind::Blob {
+                return Err(to_read_object_err(
+                    io::Error::other(format!(
+                        "expected blob, found {}",
+                        object_kind_name(object.kind)
+                    )),
+                    id,
+                ));
+            }
+            return Ok(object.data.clone());
+        }
         let locked_repo = self.lock_git_repo();
-        let git_blob_id = validate_git_object_id(&locked_repo, id)?;
         let mut blob = locked_repo
             .find_object(git_blob_id)
             .map_err(|err| map_not_found_err(err, id))?
@@ -1022,56 +1386,109 @@ impl GitBackend {
         bytes: &[u8],
         object_type: &'static str,
     ) -> BackendResult<gix::hash::ObjectId> {
-        let oid = gix::objs::compute_hash(
-            self.base_repo.objects.object_hash(),
-            gix::objs::Kind::Blob,
-            bytes,
-        )
-        .map_err(|err| BackendError::WriteObject {
-            object_type,
-            source: Box::new(err),
-        })?;
-
-        self.write_object_with_known_id(gix::objs::Kind::Blob, bytes, oid, object_type)?;
-        Ok(oid)
+        self.write_object_bytes(gix::objs::Kind::Blob, bytes.to_vec(), object_type)
     }
 
-    fn write_object_with_known_id(
+    fn write_object_bytes(
         &self,
         kind: gix::objs::Kind,
-        bytes: &[u8],
-        oid: gix::hash::ObjectId,
+        bytes: Vec<u8>,
         object_type: &'static str,
-    ) -> BackendResult<()> {
-        write_object_with_known_id_on_pool(
+    ) -> BackendResult<gix::hash::ObjectId> {
+        let oid = gix::objs::compute_hash(self.base_repo.objects.object_hash(), kind, &bytes)
+            .map_err(|err| BackendError::WriteObject {
+                object_type,
+                source: Box::new(err),
+            })?;
+
+        write_or_buffer_object_on_pool(
             &self.objects_dir,
             &self.written_objects,
             &self.write_repos,
+            &self.write_batch_state,
+            &self.buffered_objects,
             kind,
             bytes,
             oid,
             object_type,
-        )
+        )?;
+        Ok(oid)
     }
 }
 
-fn write_object_with_known_id_on_pool(
+fn compress_git_object_data(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let mut writer =
+        gix::zlib::stream::deflate::Write::new(Vec::new(), gix::zlib::Compression::DEFAULT);
+    writer.write_all(bytes)?;
+    writer.flush()?;
+    Ok(writer.into_inner())
+}
+
+fn buffer_git_object(
+    batch: &mut GitWriteBatch,
+    buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+    kind: gix::objs::Kind,
+    bytes: Vec<u8>,
+    compressed_data: Vec<u8>,
+    oid: gix::hash::ObjectId,
+) -> BackendResult<()> {
+    let mut objects = buffered_objects.lock().unwrap();
+    if objects.contains_key(&oid) {
+        return Ok(());
+    }
+    let object = Arc::new(BufferedGitObject {
+        kind,
+        data: bytes,
+        compressed_data,
+    });
+    objects.insert(oid, object);
+    batch.object_ids.push(oid);
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments)]
+fn write_or_buffer_object_on_pool(
     objects_dir: &Path,
     written_objects: &GitObjectWriteTracker,
     write_repos: &GitWriteRepoPool,
+    write_batch_state: &Mutex<GitWriteBatchState>,
+    buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
     kind: gix::objs::Kind,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     oid: gix::hash::ObjectId,
     object_type: &'static str,
 ) -> BackendResult<()> {
     written_objects.write_once(oid, || {
-        // Avoid recompressing loose objects that are already present. Packed objects
-        // are intentionally not checked here; finding those would require an ODB lookup.
+        // Packed objects are intentionally not checked here; finding those would
+        // require an ODB lookup. Avoid recompressing an existing loose object.
         if loose_object_path(objects_dir, &oid).is_file() {
             return Ok(());
         }
+        let batch_active = write_batch_state.lock().unwrap().batch.is_some();
+        if batch_active {
+            if buffered_objects.lock().unwrap().contains_key(&oid) {
+                return Ok(());
+            }
+            let compressed_data =
+                compress_git_object_data(&bytes).map_err(|err| BackendError::WriteObject {
+                    object_type,
+                    source: Box::new(err),
+                })?;
+            let mut state = write_batch_state.lock().unwrap();
+            if let Some(batch) = state.batch.as_mut() {
+                return buffer_git_object(
+                    batch,
+                    buffered_objects,
+                    kind,
+                    bytes,
+                    compressed_data,
+                    oid,
+                );
+            }
+        }
+
         write_repos
-            .with_repo(|repo| write_object_with_known_id(repo, kind, bytes, oid, object_type))
+            .with_repo(|repo| write_object_with_known_id(repo, kind, &bytes, oid, object_type))
     })
 }
 
@@ -1200,9 +1617,17 @@ fn commit_from_git_without_root_parent(
     git_object: &gix::Object,
     is_shallow: bool,
 ) -> BackendResult<Commit> {
+    commit_from_git_bytes(id, &git_object.data, is_shallow, git_object.id.kind())
+}
+
+fn commit_from_git_bytes(
+    id: &CommitId,
+    data: &[u8],
+    is_shallow: bool,
+    hash_kind: gix::hash::Kind,
+) -> BackendResult<Commit> {
     let decode_err = |err: gix::objs::decode::Error| to_read_object_err(err, id);
-    let commit = git_object
-        .try_to_commit_ref()
+    let commit = gix::objs::CommitRef::from_bytes(data, hash_kind)
         .map_err(|err| to_read_object_err(err, id))?;
 
     // If the git header has a change-id field, we attempt to convert that to a
@@ -1246,8 +1671,11 @@ fn commit_from_git_without_root_parent(
     let secure_sig = commit
         .extra_headers
         .iter()
-        .any(|(k, _)| *k == signature_field_name(git_object.id.kind()))
-        .then(|| CommitRefIter::signature(&git_object.data, git_object.id.kind()))
+        // gix does not recognize gpgsig-sha256, but prevent future footguns by checking for it too
+        .any(|(k, _)| {
+            *k == signature_field_name(hash_kind) || *k == "gpgsig" || *k == "gpgsig-sha256"
+        })
+        .then(|| CommitRefIter::signature(data, hash_kind))
         .transpose()
         .map_err(decode_err)?
         .flatten()
@@ -1484,17 +1912,26 @@ fn recreate_no_gc_refs(
     Ok(())
 }
 
-fn run_git_gc(program: &OsStr, git_dir: &Path, keep_newer: SystemTime) -> Result<(), GitGcError> {
-    let keep_newer = keep_newer
+fn git_gc_command(program: &OsStr, git_dir: &Path, options: GcOptions) -> Command {
+    let keep_newer = options
+        .keep_newer
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default(); // underflow
     let mut git = Command::new(program);
     git.arg("--git-dir=.") // turn off discovery
         .arg("gc")
         .arg(format!("--prune=@{} +0000", keep_newer.as_secs()));
+    if !options.use_cruft {
+        git.arg("--no-cruft");
+    }
     // Don't specify it by GIT_DIR/--git-dir. On Windows, the path could be
     // canonicalized as UNC path, which wouldn't be supported by git.
     git.current_dir(git_dir);
+    git
+}
+
+fn run_git_gc(program: &OsStr, git_dir: &Path, options: GcOptions) -> Result<(), GitGcError> {
+    let mut git = git_gc_command(program, git_dir, options);
     // TODO: pass output to UI layer instead of printing directly here
     tracing::info!(?git, "running git gc");
     let status = git.status().map_err(GitGcError::GcCommand)?;
@@ -1509,7 +1946,13 @@ fn validate_git_object_id(
     repo: &gix::Repository,
     id: &impl ObjectId,
 ) -> BackendResult<gix::ObjectId> {
-    let expected_kind = repo.object_hash();
+    validate_git_object_id_kind(repo.object_hash(), id)
+}
+
+fn validate_git_object_id_kind(
+    expected_kind: gix::hash::Kind,
+    id: &impl ObjectId,
+) -> BackendResult<gix::ObjectId> {
     match gix::ObjectId::try_from(id.as_bytes()) {
         Ok(id) if id.kind() == expected_kind => Ok(id),
         _ => Err(BackendError::InvalidHashLength {
@@ -1605,49 +2048,77 @@ fn read_tree_from_git_repo(
         .iter()
         .map(|entry| -> BackendResult<_> {
             let entry = entry.map_err(|err| to_read_object_err(err, id))?;
-            let name = RepoPathComponentBuf::new(
-                str::from_utf8(entry.filename()).map_err(|err| to_invalid_utf8_err(err, id))?,
-            )
-            .unwrap();
-            let value = match entry.mode().kind() {
-                gix::object::tree::EntryKind::Tree => {
-                    let id = TreeId::from_bytes(entry.oid().as_bytes());
-                    TreeValue::Tree(id)
-                }
-                gix::object::tree::EntryKind::Blob => {
-                    let id = FileId::from_bytes(entry.oid().as_bytes());
-                    TreeValue::File {
-                        id,
-                        executable: false,
-                        copy_id: CopyId::placeholder(),
-                    }
-                }
-                gix::object::tree::EntryKind::BlobExecutable => {
-                    let id = FileId::from_bytes(entry.oid().as_bytes());
-                    TreeValue::File {
-                        id,
-                        executable: true,
-                        copy_id: CopyId::placeholder(),
-                    }
-                }
-                gix::object::tree::EntryKind::Link => {
-                    let id = SymlinkId::from_bytes(entry.oid().as_bytes());
-                    TreeValue::Symlink(id)
-                }
-                gix::object::tree::EntryKind::Commit => {
-                    let id = CommitId::from_bytes(entry.oid().as_bytes());
-                    TreeValue::GitSubmodule(id)
-                }
-            };
-            Ok((name, value))
+            tree_entry_from_git(entry.filename(), entry.mode().kind(), entry.oid(), id)
         })
         .try_collect()?;
+    sort_git_tree_entries(&mut entries);
+    Ok(Tree::from_sorted_entries(entries))
+}
+
+fn read_tree_from_git_bytes(
+    data: &[u8],
+    id: &TreeId,
+    hash_kind: gix::hash::Kind,
+) -> BackendResult<Tree> {
+    let mut entries: Vec<_> = gix::objs::TreeRefIter::from_bytes(data, hash_kind)
+        .map(|entry| -> BackendResult<_> {
+            let entry = entry.map_err(|err| to_read_object_err(err, id))?;
+            tree_entry_from_git(entry.filename, entry.mode.kind(), entry.oid, id)
+        })
+        .try_collect()?;
+    sort_git_tree_entries(&mut entries);
+    Ok(Tree::from_sorted_entries(entries))
+}
+
+fn tree_entry_from_git(
+    filename: &[u8],
+    kind: gix::object::tree::EntryKind,
+    oid: &gix::oid,
+    id: &TreeId,
+) -> BackendResult<(RepoPathComponentBuf, TreeValue)> {
+    let name = RepoPathComponentBuf::new(
+        str::from_utf8(filename).map_err(|err| to_invalid_utf8_err(err, id))?,
+    )
+    .unwrap();
+    let value = match kind {
+        gix::object::tree::EntryKind::Tree => {
+            let id = TreeId::from_bytes(oid.as_bytes());
+            TreeValue::Tree(id)
+        }
+        gix::object::tree::EntryKind::Blob => {
+            let id = FileId::from_bytes(oid.as_bytes());
+            TreeValue::File {
+                id,
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            }
+        }
+        gix::object::tree::EntryKind::BlobExecutable => {
+            let id = FileId::from_bytes(oid.as_bytes());
+            TreeValue::File {
+                id,
+                executable: true,
+                copy_id: CopyId::placeholder(),
+            }
+        }
+        gix::object::tree::EntryKind::Link => {
+            let id = SymlinkId::from_bytes(oid.as_bytes());
+            TreeValue::Symlink(id)
+        }
+        gix::object::tree::EntryKind::Commit => {
+            let id = CommitId::from_bytes(oid.as_bytes());
+            TreeValue::GitSubmodule(id)
+        }
+    };
+    Ok((name, value))
+}
+
+fn sort_git_tree_entries(entries: &mut [(RepoPathComponentBuf, TreeValue)]) {
     // While Git tree entries are sorted, the rule is slightly different.
     // Directory names are sorted as if they had trailing "/".
     if !entries.is_sorted_by_key(|(name, _)| name) {
         entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     }
-    Ok(Tree::from_sorted_entries(entries))
 }
 
 #[async_trait]
@@ -1711,8 +2182,27 @@ impl Backend for GitBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
+        let git_blob_id = validate_git_object_id_kind(self.base_repo.objects.object_hash(), id)?;
+        let buffered_object = self
+            .buffered_objects
+            .lock()
+            .unwrap()
+            .get(&git_blob_id)
+            .cloned();
+        if let Some(object) = buffered_object {
+            if object.kind != gix::objs::Kind::Blob {
+                return Err(to_read_object_err(
+                    io::Error::other(format!(
+                        "expected blob, found {}",
+                        object_kind_name(object.kind)
+                    )),
+                    id,
+                ));
+            }
+            return String::from_utf8(object.data.clone())
+                .map_err(|err| to_invalid_utf8_err(err.utf8_error(), id));
+        }
         let locked_repo = self.lock_git_repo();
-        let git_blob_id = validate_git_object_id(&locked_repo, id)?;
         let mut blob = locked_repo
             .find_object(git_blob_id)
             .map_err(|err| map_not_found_err(err, id))?
@@ -1750,20 +2240,34 @@ impl Backend for GitBackend {
         if id == &self.empty_tree_id {
             return Ok(Tree::default());
         }
-        // File snapshotting already runs on Rayon workers. Blocking one of
-        // those workers while waiting for another job on the same pool can
-        // deadlock when all workers reach this path at once.
+        let git_tree_id = validate_git_object_id_kind(self.base_repo.objects.object_hash(), id)?;
+        let buffered_object = self
+            .buffered_objects
+            .lock()
+            .unwrap()
+            .get(&git_tree_id)
+            .cloned();
+        if let Some(object) = buffered_object {
+            if object.kind != gix::objs::Kind::Tree {
+                return Err(to_read_object_err(
+                    io::Error::other(format!(
+                        "expected tree, found {}",
+                        object_kind_name(object.kind)
+                    )),
+                    id,
+                ));
+            }
+            return read_tree_from_git_bytes(&object.data, id, git_tree_id.kind());
+        }
+        // File snapshotting already runs on Rayon workers. Use the worker's
+        // dedicated repository instead of spawning a nested job or contending
+        // with other workers on a shared read-repository pool.
         if rayon::current_thread_index().is_some() {
             return self.read_repos.with_repo(|repo| {
                 let git_tree_id = validate_git_object_id(repo, id)?;
                 read_tree_from_git_repo(repo, id, git_tree_id)
             });
         }
-
-        let git_tree_id = {
-            let locked_repo = self.lock_git_repo();
-            validate_git_object_id(&locked_repo, id)?
-        };
 
         let read_repos = self.read_repos.clone();
         let id = id.clone();
@@ -1840,12 +2344,14 @@ impl Backend for GitBackend {
             source: Box::new(err),
         })?;
         let write_result = if rayon::current_thread_index().is_some() {
-            write_object_with_known_id_on_pool(
+            write_or_buffer_object_on_pool(
                 &self.objects_dir,
                 &self.written_objects,
                 &self.write_repos,
+                &self.write_batch_state,
+                &self.buffered_objects,
                 gix::objs::Kind::Tree,
-                &bytes,
+                bytes,
                 oid,
                 "tree",
             )
@@ -1853,14 +2359,18 @@ impl Backend for GitBackend {
             let objects_dir = self.objects_dir.clone();
             let written_objects = self.written_objects.clone();
             let write_repos = self.write_repos.clone();
+            let write_batch_state = self.write_batch_state.clone();
+            let buffered_objects = self.buffered_objects.clone();
             let (sender, receiver) = oneshot::channel();
             rayon::spawn(move || {
-                let result = write_object_with_known_id_on_pool(
+                let result = write_or_buffer_object_on_pool(
                     &objects_dir,
                     &written_objects,
                     &write_repos,
+                    &write_batch_state,
+                    &buffered_objects,
                     gix::objs::Kind::Tree,
-                    &bytes,
+                    bytes,
                     oid,
                     "tree",
                 );
@@ -1885,7 +2395,30 @@ impl Backend for GitBackend {
             ));
         }
 
-        let mut commit = {
+        let git_commit_id = validate_git_object_id_kind(self.base_repo.objects.object_hash(), id)?;
+        let buffered_object = self
+            .buffered_objects
+            .lock()
+            .unwrap()
+            .get(&git_commit_id)
+            .cloned();
+        let mut commit = if let Some(object) = buffered_object {
+            if object.kind != gix::objs::Kind::Commit {
+                return Err(to_read_object_err(
+                    io::Error::other(format!(
+                        "expected commit, found {}",
+                        object_kind_name(object.kind)
+                    )),
+                    id,
+                ));
+            }
+            commit_from_git_bytes(
+                id,
+                &object.data,
+                false,
+                self.base_repo.objects.object_hash(),
+            )?
+        } else {
             let locked_repo = self.lock_git_repo();
             let git_commit_id = validate_git_object_id(&locked_repo, id)?;
             let git_object = locked_repo
@@ -1926,7 +2459,7 @@ impl Backend for GitBackend {
         let tree_ids = &contents.root_tree;
         let git_tree_id = match tree_ids.as_resolved() {
             Some(tree_id) => validate_git_object_id(&locked_repo, tree_id)?,
-            None => write_tree_conflict(&locked_repo, tree_ids)?,
+            None => write_tree_conflict(self, &locked_repo, tree_ids)?,
         };
         let author = signature_to_git(&contents.author);
         let mut committer = signature_to_git(&contents.committer);
@@ -1982,14 +2515,8 @@ impl Backend for GitBackend {
         }
 
         if tree_ids.iter().any(|id| id == &self.empty_tree_id) {
-            let tree = gix::objs::Tree::empty();
             let tree_id =
-                locked_repo
-                    .write_object(&tree)
-                    .map_err(|err| BackendError::WriteObject {
-                        object_type: "tree",
-                        source: Box::new(err),
-                    })?;
+                self.write_object_bytes(gix::objs::Kind::Tree, Vec::new(), "empty tree")?;
             assert!(tree_id.is_empty_tree());
         }
 
@@ -2002,13 +2529,15 @@ impl Backend for GitBackend {
         // table lock. This is still racy if multiple machines are involved and the
         // repository is rsync-ed.
         let mut write_batch_state = self.write_batch_state.lock().unwrap();
+        let write_batch_active = write_batch_state.batch.is_some();
         let metadata_table = if let Some(batch) = write_batch_state.batch.as_mut() {
+            batch.ensure_object_store_lock(self.git_repo_path())?;
             GitWriteTable::Batch(batch.table(self)?)
         } else {
             let (table, table_lock) = self.read_extra_metadata_table_locked()?;
             GitWriteTable::Direct { table, table_lock }
         };
-        let id = loop {
+        let (id, buffered_commit) = loop {
             let mut commit = gix::objs::Commit {
                 message: message.to_owned().into(),
                 tree: git_tree_id,
@@ -2035,13 +2564,29 @@ impl Backend for GitBackend {
                 contents.secure_sig = Some(SecureSig { data, sig });
             }
 
-            let git_id =
-                locked_repo
-                    .write_object(&commit)
-                    .map_err(|err| BackendError::WriteObject {
-                        object_type: "commit",
-                        source: Box::new(err),
-                    })?;
+            let (git_id, commit_data) = if write_batch_active {
+                let mut data = Vec::with_capacity(512);
+                commit.write_to(&mut data).unwrap();
+                let git_id = gix::objs::compute_hash(
+                    self.base_repo.objects.object_hash(),
+                    gix::objs::Kind::Commit,
+                    &data,
+                )
+                .map_err(|err| BackendError::WriteObject {
+                    object_type: "commit",
+                    source: Box::new(err),
+                })?;
+                (git_id, Some(data))
+            } else {
+                let git_id =
+                    locked_repo
+                        .write_object(&commit)
+                        .map_err(|err| BackendError::WriteObject {
+                            object_type: "commit",
+                            source: Box::new(err),
+                        })?;
+                (git_id.detach(), None)
+            };
 
             match metadata_table.get_value(git_id.as_bytes()) {
                 Some(existing_extras) if existing_extras != extras => {
@@ -2060,20 +2605,57 @@ impl Backend for GitBackend {
                     // and read back by `jj`.
                     committer.time.seconds -= 1;
                 }
-                _ => break CommitId::from_bytes(git_id.as_bytes()),
+                _ => {
+                    break (
+                        CommitId::from_bytes(git_id.as_bytes()),
+                        commit_data.map(|data| (git_id, data)),
+                    );
+                }
             }
         };
 
-        // Everything up to this point had no permanent effect on the repo except
-        // GC-able objects
-        locked_repo
-            .edit_reference(to_no_gc_ref_update(&id))
-            .map_err(|err| BackendError::Other(Box::new(err)))?;
+        if !write_batch_active {
+            // Everything up to this point had no permanent effect on the repo except
+            // GC-able objects.
+            locked_repo
+                .edit_reference(to_no_gc_ref_update(&id))
+                .map_err(|err| BackendError::Other(Box::new(err)))?;
+        }
 
         // Update the signature to match the one that was actually written to the object
         // store
         contents.committer.timestamp.timestamp = MillisSinceEpoch(committer.time.seconds * 1000);
         metadata_table.finish(self, id.to_bytes(), extras)?;
+        if write_batch_active {
+            let (git_id, data) = buffered_commit.unwrap();
+            self.written_objects.write_once(git_id, || {
+                if loose_object_path(&self.objects_dir, &git_id).is_file() {
+                    return Ok(());
+                }
+                if self.buffered_objects.lock().unwrap().contains_key(&git_id) {
+                    return Ok(());
+                }
+                let compressed_data =
+                    compress_git_object_data(&data).map_err(|err| BackendError::WriteObject {
+                        object_type: "commit",
+                        source: Box::new(err),
+                    })?;
+                buffer_git_object(
+                    write_batch_state.batch.as_mut().unwrap(),
+                    &self.buffered_objects,
+                    gix::objs::Kind::Commit,
+                    data,
+                    compressed_data,
+                    git_id,
+                )
+            })?;
+            write_batch_state
+                .batch
+                .as_mut()
+                .unwrap()
+                .commit_ids
+                .insert(id.clone());
+        }
         Ok((id, contents))
     }
 
@@ -2083,6 +2665,19 @@ impl Backend for GitBackend {
         root_id: &CommitId,
         head_id: &CommitId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
+        let hash_kind = self.base_repo.objects.object_hash();
+        let root_oid = validate_git_object_id_kind(hash_kind, root_id)?;
+        let head_oid = validate_git_object_id_kind(hash_kind, head_id)?;
+        let needs_flush = {
+            let objects = self.buffered_objects.lock().unwrap();
+            objects.contains_key(&root_oid) || objects.contains_key(&head_oid)
+        };
+        if needs_flush {
+            // gix's copy detector recursively reads trees through its own ODB
+            // instead of the Backend interface, so checkpoint the quarantine
+            // before handing these commits to it.
+            self.flush_active_write_batch()?;
+        }
         let repo = self.git_repo();
         let root_tree = self.read_tree_for_commit(&repo, root_id)?;
         let head_tree = self.read_tree_for_commit(&repo, head_id)?;
@@ -2157,13 +2752,26 @@ impl Backend for GitBackend {
     }
 
     #[tracing::instrument(skip(self, index))]
-    fn gc(&self, index: &dyn Index, keep_newer: SystemTime) -> BackendResult<()> {
+    fn gc(&self, index: &dyn Index, options: GcOptions) -> BackendResult<()> {
         let git_repo = self.lock_git_repo();
+        // A workspace command already holds this lock through its write batch.
+        // Direct library callers acquire it here. Keep the batch-state guard
+        // for the entire GC so in-process writers cannot race us either.
+        let mut write_batch_state = self.write_batch_state.lock().unwrap();
+        let _object_store_lock = if let Some(batch) = write_batch_state.batch.as_mut() {
+            batch.ensure_object_store_lock(self.git_repo_path())?;
+            None
+        } else {
+            Some(
+                FileLock::lock(self.git_object_store_lock_path())
+                    .map_err(|err| BackendError::Other(Box::new(err)))?,
+            )
+        };
         let new_heads = index
             .all_heads_for_gc()
             .map_err(|err| BackendError::Other(err.into()))?
             .filter(|id| *id != self.root_commit_id);
-        recreate_no_gc_refs(&git_repo, new_heads, keep_newer)?;
+        recreate_no_gc_refs(&git_repo, new_heads, options.keep_newer)?;
 
         // No locking is needed since we aren't going to add new "commits".
         let table = self.cached_extra_metadata_table()?;
@@ -2171,15 +2779,11 @@ impl Backend for GitBackend {
         // mtime <= keep_newer? (it won't be consistent with no-gc refs
         // preserved by the keep_newer timestamp though)
         self.extra_metadata_store
-            .gc(&table, keep_newer)
+            .gc(&table, options.keep_newer)
             .map_err(|err| BackendError::Other(err.into()))?;
 
-        run_git_gc(
-            self.git_executable.as_ref(),
-            self.git_repo_path(),
-            keep_newer,
-        )
-        .map_err(|err| BackendError::Other(err.into()))?;
+        run_git_gc(self.git_executable.as_ref(), self.git_repo_path(), options)
+            .map_err(|err| BackendError::Other(err.into()))?;
         // Since "git gc" will move loose refs into packed refs, in-memory
         // packed-refs cache should be invalidated without relying on mtime.
         git_repo.refs.force_refresh_packed_buffer().ok();
@@ -2193,6 +2797,7 @@ impl Backend for GitBackend {
 /// present. The rest of the tree is copied from the first term of the conflict,
 /// which prevents editors with Git support from highlighting all files as new.
 fn write_tree_conflict(
+    backend: &GitBackend,
     repo: &gix::Repository,
     conflict: &Merge<TreeId>,
 ) -> BackendResult<gix::ObjectId> {
@@ -2213,9 +2818,8 @@ fn write_tree_conflict(
         oid: gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
     })
     .collect_vec();
-    let readme_id = repo
-        .write_blob(
-            r#"This commit was made by jj, https://jj-vcs.dev/.
+    let readme_id = backend.write_blob(
+        r#"This commit was made by jj, https://jj-vcs.dev/.
 The commit contains file conflicts, and therefore looks wrong when used with
 plain Git or other tools that are unfamiliar with jj.
 
@@ -2226,37 +2830,64 @@ https://docs.jj-vcs.dev/latest/git-compatibility/#format-mapping-details
 If you see this file in your working copy, it probably means that you used a
 regular `git` command to check out a conflicted commit. Use `jj abandon` to
 recover.
-"#,
-        )
-        .map_err(|err| {
-            BackendError::Other(format!("Failed to write README for conflict tree: {err}").into())
-        })?
-        .detach();
+"#
+        .as_bytes(),
+        "conflict README",
+    )?;
     entries.push(gix::objs::tree::Entry {
         mode: gix::object::tree::EntryKind::Blob.into(),
         filename: JJ_CONFLICT_README_FILE_NAME.into(),
         oid: readme_id,
     });
     let first_tree_id = conflict.first();
-    let first_tree = repo
-        .find_tree(gix::ObjectId::from_bytes_or_panic(first_tree_id.as_bytes()))
-        .map_err(|err| to_read_object_err(err, first_tree_id))?;
-    for entry in first_tree.iter() {
-        let entry = entry.map_err(|err| to_read_object_err(err, first_tree_id))?;
-        if !entry.filename().starts_with(b".jjconflict")
-            && entry.filename() != JJ_CONFLICT_README_FILE_NAME
+    let first_tree_id_git =
+        validate_git_object_id_kind(backend.base_repo.objects.object_hash(), first_tree_id)?;
+    let buffered_tree = backend
+        .buffered_objects
+        .lock()
+        .unwrap()
+        .get(&first_tree_id_git)
+        .cloned();
+    let first_tree_entries: Vec<gix::objs::tree::Entry> = if let Some(object) = buffered_tree {
+        if object.kind != gix::objs::Kind::Tree {
+            return Err(to_read_object_err(
+                io::Error::other(format!(
+                    "expected tree, found {}",
+                    object_kind_name(object.kind)
+                )),
+                first_tree_id,
+            ));
+        }
+        gix::objs::TreeRefIter::from_bytes(&object.data, first_tree_id_git.kind())
+            .map(|entry| -> BackendResult<_> {
+                let entry = entry.map_err(|err| to_read_object_err(err, first_tree_id))?;
+                Ok(gix::objs::tree::Entry::from(entry))
+            })
+            .try_collect()?
+    } else {
+        let first_tree = repo
+            .find_tree(first_tree_id_git)
+            .map_err(|err| to_read_object_err(err, first_tree_id))?;
+        first_tree
+            .iter()
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.detach().into())
+                    .map_err(|err| to_read_object_err(err, first_tree_id))
+            })
+            .try_collect()?
+    };
+    for entry in first_tree_entries {
+        if !entry.filename.starts_with(b".jjconflict")
+            && entry.filename != JJ_CONFLICT_README_FILE_NAME
         {
-            entries.push(entry.detach().into());
+            entries.push(entry);
         }
     }
     entries.sort_unstable();
-    let id = repo
-        .write_object(gix::objs::Tree { entries })
-        .map_err(|err| BackendError::WriteObject {
-            object_type: "tree",
-            source: Box::new(err),
-        })?;
-    Ok(id.detach())
+    let mut data = Vec::new();
+    gix::objs::Tree { entries }.write_to(&mut data).unwrap();
+    backend.write_object_bytes(gix::objs::Kind::Tree, data, "conflict tree")
 }
 
 #[cfg(test)]
@@ -2315,6 +2946,33 @@ mod tests {
         expected.extend_from_slice(&[1; SHA1_LENGTH]);
         assert_eq!(bytes, expected);
         Ok(())
+    }
+
+    #[test]
+    fn git_gc_cruft_policy_is_explicit() {
+        let keep_newer = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        let command_args = |use_cruft| {
+            git_gc_command(
+                OsStr::new("git"),
+                Path::new("repo"),
+                GcOptions {
+                    keep_newer,
+                    use_cruft,
+                },
+            )
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect_vec()
+        };
+
+        assert_eq!(
+            command_args(true),
+            ["--git-dir=.", "gc", "--prune=@42 +0000"]
+        );
+        assert_eq!(
+            command_args(false),
+            ["--git-dir=.", "gc", "--prune=@42 +0000", "--no-cruft"]
+        );
     }
 
     #[test]
@@ -2391,6 +3049,280 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn write_batch_holds_one_object_store_lock() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+        let lock_path = backend.git_object_store_lock_path();
+
+        let mut first_batch = backend.start_write_batch();
+        let second_batch = backend.start_write_batch();
+        assert!(FileLock::try_lock(lock_path.clone())?.is_some());
+        backend
+            .write_file_bytes(RepoPath::root(), b"take the lazy lock")
+            .block_on()?;
+        first_batch.flush()?;
+        assert!(FileLock::try_lock(lock_path.clone())?.is_none());
+        first_batch.finish()?;
+        assert!(FileLock::try_lock(lock_path.clone())?.is_none());
+        second_batch.finish()?;
+        assert!(FileLock::try_lock(lock_path)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn write_batch_packs_git_objects() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        let mut write_batch = backend.start_write_batch();
+        let lock_path = backend.git_object_store_lock_path();
+        let file_id = backend
+            .write_file_bytes(RepoPath::root(), b"packed content")
+            .block_on()?;
+        let tree = Tree::from_sorted_entries(vec![(
+            RepoPathComponentBuf::new("file").unwrap(),
+            TreeValue::File {
+                id: file_id.clone(),
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            },
+        )]);
+        let tree_id = backend.write_tree(RepoPath::root(), &tree).block_on()?;
+
+        let file_oid = validate_git_object_id(&git_repo, &file_id)?;
+        let tree_oid = validate_git_object_id(&git_repo, &tree_id)?;
+        assert!(!loose_object_path(&backend.objects_dir, &file_oid).exists());
+        assert!(!loose_object_path(&backend.objects_dir, &tree_oid).exists());
+        assert_eq!(
+            backend
+                .read_file_bytes(RepoPath::root(), &file_id)
+                .block_on()?,
+            b"packed content"
+        );
+        assert_eq!(
+            backend.read_tree(RepoPath::root(), &tree_id).block_on()?,
+            tree
+        );
+
+        for i in 0..MIN_BUFFERED_OBJECTS_PER_PACK {
+            backend
+                .write_file_bytes(RepoPath::root(), format!("object {i}").as_bytes())
+                .block_on()?;
+        }
+        let commit = Commit {
+            parents: vec![backend.root_commit_id().clone()],
+            predecessors: vec![],
+            root_tree: Merge::resolved(tree_id.clone()),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::from_hex("1111eeee1111eeee1111eeee1111eeee"),
+            description: "packed tree".to_string(),
+            author: create_signature(),
+            committer: create_signature(),
+            secure_sig: None,
+        };
+        let (commit_id, _) = backend.write_commit(commit, None).block_on()?;
+        let second_file_id = backend
+            .write_file_bytes(RepoPath::root(), b"second packed content")
+            .block_on()?;
+        let second_tree = Tree::from_sorted_entries(vec![(
+            RepoPathComponentBuf::new("file").unwrap(),
+            TreeValue::File {
+                id: second_file_id,
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            },
+        )]);
+        let second_tree_id = backend
+            .write_tree(RepoPath::root(), &second_tree)
+            .block_on()?;
+        let second_commit = Commit {
+            parents: vec![commit_id.clone()],
+            predecessors: vec![],
+            root_tree: Merge::resolved(second_tree_id.clone()),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::from_hex("2222dddd2222dddd2222dddd2222dddd"),
+            description: "second packed tree".to_string(),
+            author: create_signature(),
+            committer: create_signature(),
+            secure_sig: None,
+        };
+        let (second_commit_id, _) = backend.write_commit(second_commit, None).block_on()?;
+
+        assert!(!loose_object_path(&backend.objects_dir, &file_oid).exists());
+        assert!(!loose_object_path(&backend.objects_dir, &tree_oid).exists());
+        let fresh_repo =
+            gix::ThreadSafeRepository::open_opts(&git_repo_path, open_options())?.to_thread_local();
+        let keep_ref_name = format!("{NO_GC_REF_NAMESPACE}{commit_id}");
+        let second_keep_ref_name = format!("{NO_GC_REF_NAMESPACE}{second_commit_id}");
+        assert!(fresh_repo.find_object(file_oid).is_err());
+        assert!(fresh_repo.find_object(tree_oid).is_err());
+        assert!(
+            fresh_repo
+                .find_object(validate_git_object_id(&fresh_repo, &commit_id)?)
+                .is_err()
+        );
+        assert!(
+            fresh_repo
+                .find_object(validate_git_object_id(&fresh_repo, &second_tree_id)?)
+                .is_err()
+        );
+        assert!(
+            fresh_repo
+                .find_object(validate_git_object_id(&fresh_repo, &second_commit_id)?)
+                .is_err()
+        );
+        assert!(fresh_repo.find_reference(keep_ref_name.as_str()).is_err());
+        assert!(
+            fresh_repo
+                .find_reference(second_keep_ref_name.as_str())
+                .is_err()
+        );
+        write_batch.flush()?;
+        assert!(FileLock::try_lock(lock_path)?.is_none());
+        let pack_files = fs::read_dir(backend.objects_dir.join("pack"))?
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension() == Some(OsStr::new("pack")))
+            .count();
+        assert_eq!(pack_files, 1);
+        let fresh_repo =
+            gix::ThreadSafeRepository::open_opts(&git_repo_path, open_options())?.to_thread_local();
+        let mut blob = fresh_repo.find_object(file_oid)?.try_into_blob()?;
+        assert_eq!(blob.take_data(), b"packed content");
+        assert!(fresh_repo.find_object(tree_oid)?.try_into_tree().is_ok());
+        assert!(
+            fresh_repo
+                .find_object(validate_git_object_id(&fresh_repo, &second_tree_id)?)?
+                .try_into_tree()
+                .is_ok()
+        );
+        assert!(
+            fresh_repo
+                .find_object(validate_git_object_id(&fresh_repo, &commit_id)?)?
+                .try_into_commit()
+                .is_ok()
+        );
+        assert!(fresh_repo.find_reference(keep_ref_name.as_str()).is_ok());
+        assert!(
+            fresh_repo
+                .find_reference(second_keep_ref_name.as_str())
+                .is_ok()
+        );
+        let reopened_backend = GitBackend::load(&settings, &store_path)?;
+        let reopened_commit = reopened_backend.read_commit(&commit_id).block_on()?;
+        assert_eq!(
+            reopened_commit.change_id,
+            ChangeId::from_hex("1111eeee1111eeee1111eeee1111eeee")
+        );
+        assert_eq!(reopened_commit.root_tree, Merge::resolved(tree_id));
+        let reopened_second_commit = reopened_backend.read_commit(&second_commit_id).block_on()?;
+        assert_eq!(
+            reopened_second_commit.change_id,
+            ChangeId::from_hex("2222dddd2222dddd2222dddd2222dddd")
+        );
+        assert_eq!(
+            reopened_second_commit.root_tree,
+            Merge::resolved(second_tree_id)
+        );
+        write_batch.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn small_write_batch_keeps_loose_objects() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        let write_batch = backend.start_write_batch();
+        let file_id = backend
+            .write_file_bytes(RepoPath::root(), b"small batch")
+            .block_on()?;
+        let symlink_id = backend
+            .write_symlink(RepoPath::root(), "buffered-target")
+            .block_on()?;
+        assert_eq!(
+            backend
+                .read_symlink(RepoPath::root(), &symlink_id)
+                .block_on()?,
+            "buffered-target"
+        );
+        let file_oid = validate_git_object_id(&git_repo, &file_id)?;
+        write_batch.finish()?;
+
+        assert!(loose_object_path(&backend.objects_dir, &file_oid).exists());
+        assert_eq!(fs::read_dir(backend.objects_dir.join("pack"))?.count(), 0);
+        let reopened_backend = GitBackend::load(&settings, &store_path)?;
+        assert_eq!(
+            reopened_backend
+                .read_symlink(RepoPath::root(), &symlink_id)
+                .block_on()?,
+            "buffered-target"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_conflicted_commit_with_buffered_trees() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        let write_batch = backend.start_write_batch();
+        let mut tree_ids = Vec::new();
+        for i in 0..3 {
+            let file_id = backend
+                .write_file_bytes(RepoPath::root(), format!("side {i}").as_bytes())
+                .block_on()?;
+            let tree = Tree::from_sorted_entries(vec![(
+                RepoPathComponentBuf::new("file").unwrap(),
+                TreeValue::File {
+                    id: file_id,
+                    executable: false,
+                    copy_id: CopyId::placeholder(),
+                },
+            )]);
+            tree_ids.push(backend.write_tree(RepoPath::root(), &tree).block_on()?);
+        }
+        let root_tree = Merge::from_vec(tree_ids);
+        let commit = Commit {
+            parents: vec![backend.root_commit_id().clone()],
+            predecessors: vec![],
+            root_tree: root_tree.clone(),
+            conflict_labels: Merge::resolved(String::new()),
+            change_id: ChangeId::from_hex("1111eeee1111eeee1111eeee1111eeee"),
+            description: "conflicted".to_string(),
+            author: create_signature(),
+            committer: create_signature(),
+            secure_sig: None,
+        };
+
+        let (commit_id, _) = backend.write_commit(commit, None).block_on()?;
+        write_batch.finish()?;
+
+        let stored_commit = backend.read_commit(&commit_id).block_on()?;
+        assert_eq!(stored_commit.root_tree, root_tree);
+        Ok(())
     }
 
     fn git_init(directory: impl AsRef<Path>, object_hash: gix::hash::Kind) -> gix::Repository {

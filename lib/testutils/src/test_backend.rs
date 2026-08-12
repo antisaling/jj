@@ -22,7 +22,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::AsyncRead;
@@ -42,6 +41,7 @@ use jj_lib::backend::CopyHistory;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::CopyRecord;
 use jj_lib::backend::FileId;
+use jj_lib::backend::GcOptions;
 use jj_lib::backend::RelatedCopy;
 use jj_lib::backend::SecureSig;
 use jj_lib::backend::SigningFn;
@@ -428,7 +428,7 @@ impl Backend for TestBackend {
         Ok(stream::empty().boxed())
     }
 
-    fn gc(&self, _index: &dyn Index, _keep_newer: SystemTime) -> BackendResult<()> {
+    fn gc(&self, _index: &dyn Index, _options: GcOptions) -> BackendResult<()> {
         Ok(())
     }
 }

@@ -289,7 +289,21 @@ impl Store {
     }
 
     pub fn gc(&self, index: &dyn Index, keep_newer: SystemTime) -> BackendResult<()> {
-        self.backend.gc(index, keep_newer)
+        self.gc_with_options(
+            index,
+            backend::GcOptions {
+                keep_newer,
+                use_cruft: true,
+            },
+        )
+    }
+
+    pub fn gc_with_options(
+        &self,
+        index: &dyn Index,
+        options: backend::GcOptions,
+    ) -> BackendResult<()> {
+        self.backend.gc(index, options)
     }
 
     /// Clear cached objects. Mainly intended for testing.

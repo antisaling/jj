@@ -927,7 +927,16 @@ pub trait Backend: Any + Send + Sync + Debug {
     /// All commits found in the `index` won't be removed. In addition to that,
     /// objects created after `keep_newer` will be preserved. This mitigates a
     /// risk of deleting new commits created concurrently by another process.
-    fn gc(&self, index: &dyn Index, keep_newer: SystemTime) -> BackendResult<()>;
+    fn gc(&self, index: &dyn Index, options: GcOptions) -> BackendResult<()>;
+}
+
+/// Options controlling backend garbage collection.
+#[derive(Clone, Copy, Debug)]
+pub struct GcOptions {
+    /// Objects created after this time must be preserved.
+    pub keep_newer: SystemTime,
+    /// Whether unreachable objects should be retained in a compact cruft store.
+    pub use_cruft: bool,
 }
 
 impl dyn Backend {

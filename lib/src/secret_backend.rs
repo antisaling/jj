@@ -16,7 +16,6 @@
 
 use std::path::Path;
 use std::pin::Pin;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::AsyncRead;
@@ -33,6 +32,7 @@ use crate::backend::CopyHistory;
 use crate::backend::CopyId;
 use crate::backend::CopyRecord;
 use crate::backend::FileId;
+use crate::backend::GcOptions;
 use crate::backend::RelatedCopy;
 use crate::backend::SigningFn;
 use crate::backend::SymlinkId;
@@ -204,7 +204,7 @@ impl Backend for SecretBackend {
         self.inner.get_copy_records(paths, root, head)
     }
 
-    fn gc(&self, index: &dyn Index, keep_newer: SystemTime) -> BackendResult<()> {
-        self.inner.gc(index, keep_newer)
+    fn gc(&self, index: &dyn Index, options: GcOptions) -> BackendResult<()> {
+        self.inner.gc(index, options)
     }
 }

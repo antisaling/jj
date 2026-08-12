@@ -14,7 +14,6 @@
 
 use std::path::Path;
 use std::pin::Pin;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::AsyncRead;
@@ -34,6 +33,7 @@ use jj_lib::backend::CopyHistory;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::CopyRecord;
 use jj_lib::backend::FileId;
+use jj_lib::backend::GcOptions;
 use jj_lib::backend::RelatedCopy;
 use jj_lib::backend::SigningFn;
 use jj_lib::backend::SymlinkId;
@@ -209,7 +209,7 @@ impl Backend for JitBackend {
         self.inner.get_copy_records(paths, root, head)
     }
 
-    fn gc(&self, index: &dyn Index, keep_newer: SystemTime) -> BackendResult<()> {
-        self.inner.gc(index, keep_newer)
+    fn gc(&self, index: &dyn Index, options: GcOptions) -> BackendResult<()> {
+        self.inner.gc(index, options)
     }
 }

@@ -16,6 +16,7 @@ use std::slice;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use jj_lib::backend::GcOptions;
 use jj_lib::repo::Repo as _;
 
 use crate::cli_util::CommandHelper;
@@ -62,6 +63,12 @@ pub async fn cmd_util_gc(
     repo.op_store()
         .gc(slice::from_ref(repo.op_id()), keep_newer)
         .await?;
-    repo.store().gc(repo.index(), keep_newer)?;
+    repo.store().gc_with_options(
+        repo.index(),
+        GcOptions {
+            keep_newer,
+            use_cruft: args.expire.is_none(),
+        },
+    )?;
     Ok(())
 }

@@ -1272,6 +1272,14 @@ where
 }
 
 impl WorkspaceCommandHelper {
+    #[cfg(feature = "git")]
+    fn flush_git_write_batch(&mut self) -> Result<(), CommandError> {
+        if let Some(write_batch) = self._git_write_batch.as_mut() {
+            write_batch.flush()?;
+        }
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     fn new(
         ui: &Ui,
@@ -1425,6 +1433,10 @@ impl WorkspaceCommandHelper {
             // state to it without updating working copy files.
             locked_ws.locked_wc().reset(&wc_commit).await?;
             tx.repo_mut().rebase_descendants().await?;
+            #[cfg(feature = "git")]
+            if let Some(write_batch) = self._git_write_batch.as_mut() {
+                write_batch.flush()?;
+            }
             self.user_repo = ReadonlyUserRepo::new(
                 self.env
                     .command
@@ -2196,6 +2208,10 @@ to the current parents may contain changes from multiple commits.
             }
 
             #[cfg(feature = "git")]
+            if let Some(write_batch) = self._git_write_batch.as_mut() {
+                write_batch.flush().map_err(snapshot_command_error)?;
+            }
+
             if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction()
             {
                 let workspace_root = self.env.workspace_root();
@@ -2403,6 +2419,13 @@ to the current parents may contain changes from multiple commits.
             maybe_new_wc_commit
         };
 
+        // Make every backend object and its metadata durable before publishing
+        // Git refs, the Git index, or the jj operation that references it. If
+        // anything below fails, these objects are merely unreachable and can
+        // be collected later.
+        #[cfg(feature = "git")]
+        self.flush_git_write_batch()?;
+
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
             if let Some(wc_commit) = &maybe_new_wc_commit {
@@ -2426,11 +2449,6 @@ to the current parents may contain changes from multiple commits.
                 .maybe_commit_transaction(tx, description)
                 .await?,
         );
-
-        #[cfg(feature = "git")]
-        if let Some(write_batch) = self._git_write_batch.take() {
-            write_batch.finish()?;
-        }
 
         // Update working copy before reporting repo changes, so that
         // potential errors while reporting changes (broken pipe, etc)
