@@ -184,6 +184,7 @@ pub struct GitBackend {
     // one for each backend method call. Our GitBackend is most likely to be
     // used in a single-threaded context.
     base_repo: gix::ThreadSafeRepository,
+    objects_dir: PathBuf,
     repo: Mutex<gix::Repository>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
@@ -320,6 +321,7 @@ impl GitBackend {
         extra_metadata_store: TableStore,
         git_settings: GitSettings,
     ) -> Self {
+        let objects_dir = base_repo.objects_dir().to_owned();
         let mut repo = base_repo.to_thread_local();
         // Rebase writes many objects that are intentionally not in the ODB yet.
         // Don't rescan the ODB from disk after every expected miss.
@@ -331,6 +333,7 @@ impl GitBackend {
         let repo = Mutex::new(repo);
         Self {
             base_repo,
+            objects_dir,
             repo,
             root_commit_id,
             root_change_id,
@@ -771,11 +774,23 @@ impl GitBackend {
         if written_objects.contains(&oid) {
             return Ok(());
         }
+        // Avoid recompressing loose objects that are already present. Packed objects
+        // are intentionally not checked here; finding those would require an ODB lookup.
+        if loose_object_path(&self.objects_dir, &oid).is_file() {
+            written_objects.insert(oid);
+            return Ok(());
+        }
         let locked_repo = self.lock_git_repo();
         write_object_with_known_id(&locked_repo, kind, bytes, oid, object_type)?;
         written_objects.insert(oid);
         Ok(())
     }
+}
+
+fn loose_object_path(objects_dir: &Path, oid: &gix::hash::oid) -> PathBuf {
+    let mut hex_buf = gix::hash::Kind::hex_buf();
+    let hex = oid.hex_to_buf(&mut hex_buf);
+    objects_dir.join(&hex[..2]).join(&hex[2..])
 }
 
 fn write_object_with_known_id(
