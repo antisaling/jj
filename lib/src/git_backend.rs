@@ -29,7 +29,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
 use std::process::ExitStatus;
-use std::process::Stdio;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -54,6 +53,7 @@ use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
 use prost::Message as _;
 use smallvec::SmallVec;
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::backend::Backend;
@@ -530,7 +530,7 @@ pub struct GitWriteBatchGuard {
     cached_extra_metadata: Arc<Mutex<Option<Arc<ReadonlyTable>>>>,
     buffered_objects: Arc<Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>>,
     write_repos: Arc<GitWriteRepoPool>,
-    git_executable: PathBuf,
+    objects_dir: PathBuf,
     git_repo_path: PathBuf,
     finished: bool,
 }
@@ -561,7 +561,7 @@ impl GitWriteBatch {
         cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
         buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
         write_repos: &GitWriteRepoPool,
-        git_executable: &Path,
+        objects_dir: &Path,
         git_repo_path: &Path,
     ) -> BackendResult<()> {
         if self.object_ids.is_empty() && self.commit_ids.is_empty() && self.table.is_none() {
@@ -573,8 +573,7 @@ impl GitWriteBatch {
             &self.commit_ids,
             buffered_objects,
             write_repos,
-            git_executable,
-            git_repo_path,
+            objects_dir,
         )?;
         if let Some(mut_table) = self.table.take() {
             let table_lock = self.table_lock.take().expect("metadata table lock missing");
@@ -595,7 +594,7 @@ impl GitWriteBatch {
         cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
         buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
         write_repos: &GitWriteRepoPool,
-        git_executable: &Path,
+        objects_dir: &Path,
         git_repo_path: &Path,
     ) -> BackendResult<()> {
         self.flush(
@@ -603,7 +602,7 @@ impl GitWriteBatch {
             cached_extra_metadata,
             buffered_objects,
             write_repos,
-            git_executable,
+            objects_dir,
             git_repo_path,
         )?;
         drop(self.object_store_lock.take());
@@ -611,12 +610,12 @@ impl GitWriteBatch {
     }
 }
 
-struct PackHashWriter<W> {
+struct GitHashWriter<W> {
     inner: W,
     hasher: Option<gix::hash::Hasher>,
 }
 
-impl<W: io::Write> PackHashWriter<W> {
+impl<W: io::Write> GitHashWriter<W> {
     fn new(inner: W, hash_kind: gix::hash::Kind) -> Self {
         Self {
             inner,
@@ -624,7 +623,7 @@ impl<W: io::Write> PackHashWriter<W> {
         }
     }
 
-    fn finish(mut self) -> io::Result<W> {
+    fn finish(mut self) -> io::Result<(W, gix::hash::ObjectId)> {
         let digest = self
             .hasher
             .take()
@@ -633,11 +632,11 @@ impl<W: io::Write> PackHashWriter<W> {
             .map_err(io::Error::other)?;
         self.inner.write_all(digest.as_bytes())?;
         self.inner.flush()?;
-        Ok(self.inner)
+        Ok((self.inner, digest))
     }
 }
 
-impl<W: io::Write> io::Write for PackHashWriter<W> {
+impl<W: io::Write> io::Write for GitHashWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buf)?;
         self.hasher.as_mut().unwrap().update(&buf[..written]);
@@ -649,90 +648,170 @@ impl<W: io::Write> io::Write for PackHashWriter<W> {
     }
 }
 
-fn write_pack_entry_header(
-    writer: &mut impl io::Write,
-    kind: gix::objs::Kind,
-    mut size: usize,
-) -> io::Result<()> {
+fn encode_pack_entry_header(kind: gix::objs::Kind, mut size: usize) -> ([u8; 16], usize) {
     let kind_bits = match kind {
         gix::objs::Kind::Commit => 1,
         gix::objs::Kind::Tree => 2,
         gix::objs::Kind::Blob => 3,
         gix::objs::Kind::Tag => 4,
     };
+    let mut header = [0; 16];
+    let mut len = 0;
     let mut byte = ((kind_bits << 4) | (size & 0xf)) as u8;
     size >>= 4;
     while size != 0 {
-        writer.write_all(&[byte | 0x80])?;
+        header[len] = byte | 0x80;
+        len += 1;
         byte = (size & 0x7f) as u8;
         size >>= 7;
     }
-    writer.write_all(&[byte])
+    header[len] = byte;
+    len += 1;
+    (header, len)
+}
+
+struct GitPackIndexEntry {
+    id: gix::hash::ObjectId,
+    offset: u64,
+    crc32: u32,
+}
+
+fn write_git_pack(
+    objects: &[(gix::hash::ObjectId, Arc<BufferedGitObject>)],
+    output: &mut fs::File,
+) -> io::Result<(gix::hash::ObjectId, Vec<GitPackIndexEntry>)> {
+    let object_count = u32::try_from(objects.len())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let hash_kind = objects[0].0.kind();
+    if objects.iter().any(|(id, _)| id.kind() != hash_kind) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pack objects use different hash kinds",
+        ));
+    }
+
+    let mut writer = GitHashWriter::new(io::BufWriter::new(output), hash_kind);
+    writer.write_all(b"PACK")?;
+    writer.write_all(&2_u32.to_be_bytes())?;
+    writer.write_all(&object_count.to_be_bytes())?;
+    let mut offset = 12_u64;
+    let mut entries = Vec::with_capacity(objects.len());
+    for (id, object) in objects {
+        let (header, header_len) = encode_pack_entry_header(object.kind, object.data.len());
+        let header = &header[..header_len];
+        let crc32 = gix::features::hash::crc32_update(
+            gix::features::hash::crc32(header),
+            &object.compressed_data,
+        );
+        writer.write_all(header)?;
+        writer.write_all(&object.compressed_data)?;
+        entries.push(GitPackIndexEntry {
+            id: *id,
+            offset,
+            crc32,
+        });
+        offset = offset
+            .checked_add(header.len() as u64)
+            .and_then(|offset| offset.checked_add(object.compressed_data.len() as u64))
+            .ok_or_else(|| io::Error::other("pack offset overflow"))?;
+    }
+    let (_, pack_hash) = writer.finish()?;
+    Ok((pack_hash, entries))
+}
+
+fn write_git_pack_index(
+    mut entries: Vec<GitPackIndexEntry>,
+    pack_hash: &gix::hash::ObjectId,
+    output: &mut fs::File,
+) -> io::Result<()> {
+    const V2_SIGNATURE: &[u8; 4] = b"\xfftOc";
+    const LARGE_OFFSET_THRESHOLD: u64 = 0x7fff_ffff;
+    const HIGH_BIT: u32 = 0x8000_0000;
+
+    entries.sort_unstable_by_key(|entry| entry.id);
+    let mut fanout = [0_u32; 256];
+    for entry in &entries {
+        let first_byte = usize::from(entry.id.as_bytes()[0]);
+        fanout[first_byte] = fanout[first_byte]
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("pack fanout overflow"))?;
+    }
+    for i in 1..fanout.len() {
+        fanout[i] = fanout[i]
+            .checked_add(fanout[i - 1])
+            .ok_or_else(|| io::Error::other("pack fanout overflow"))?;
+    }
+
+    let mut writer = GitHashWriter::new(io::BufWriter::new(output), pack_hash.kind());
+    writer.write_all(V2_SIGNATURE)?;
+    writer.write_all(&2_u32.to_be_bytes())?;
+    for value in fanout {
+        writer.write_all(&value.to_be_bytes())?;
+    }
+    for entry in &entries {
+        writer.write_all(entry.id.as_bytes())?;
+    }
+    for entry in &entries {
+        writer.write_all(&entry.crc32.to_be_bytes())?;
+    }
+    let mut large_offsets = Vec::new();
+    for entry in &entries {
+        let encoded_offset = if entry.offset > LARGE_OFFSET_THRESHOLD {
+            let index = u32::try_from(large_offsets.len())
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            if index >= HIGH_BIT {
+                return Err(io::Error::other("too many large pack offsets"));
+            }
+            large_offsets.push(entry.offset);
+            index | HIGH_BIT
+        } else {
+            entry.offset as u32
+        };
+        writer.write_all(&encoded_offset.to_be_bytes())?;
+    }
+    for offset in large_offsets {
+        writer.write_all(&offset.to_be_bytes())?;
+    }
+    writer.write_all(pack_hash.as_bytes())?;
+    writer.finish()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn write_buffered_git_pack(
     objects: &[(gix::hash::ObjectId, Arc<BufferedGitObject>)],
-    git_executable: &Path,
-    git_repo_path: &Path,
+    objects_dir: &Path,
 ) -> BackendResult<()> {
     if objects.is_empty() {
         return Ok(());
     }
-    let object_count = u32::try_from(objects.len()).map_err(|err| BackendError::WriteObject {
-        object_type: "pack",
-        source: Box::new(err),
-    })?;
-    let mut child = Command::new(git_executable)
-        .arg("--git-dir=.")
-        .arg("index-pack")
-        .arg("--stdin")
-        .current_dir(git_repo_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| BackendError::WriteObject {
-            object_type: "pack",
-            source: Box::new(err),
-        })?;
-    let stdin = child.stdin.take().unwrap();
-    let mut writer = Some(PackHashWriter::new(
-        io::BufWriter::new(stdin),
-        objects[0].0.kind(),
-    ));
-    let write_result = (|| -> io::Result<()> {
-        let writer = writer.as_mut().unwrap();
-        writer.write_all(b"PACK")?;
-        writer.write_all(&2_u32.to_be_bytes())?;
-        writer.write_all(&object_count.to_be_bytes())?;
-        for (_id, object) in objects {
-            write_pack_entry_header(writer, object.kind, object.data.len())?;
-            writer.write_all(&object.compressed_data)?;
-        }
-        Ok(())
+    let result = (|| -> io::Result<()> {
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let mut pack_temp = NamedTempFile::new_in(&pack_dir)?;
+        let (pack_hash, entries) = write_git_pack(objects, pack_temp.as_file_mut())?;
+        let mut index_temp = NamedTempFile::new_in(&pack_dir)?;
+        write_git_pack_index(entries, &pack_hash, index_temp.as_file_mut())?;
+
+        let basename = format!("pack-{pack_hash}");
+        let pack_path = pack_dir.join(format!("{basename}.pack"));
+        let index_path = pack_dir.join(format!("{basename}.idx"));
+        file_util::persist_content_addressed_temp_file(pack_temp, pack_path)?;
+        // Make the pack durable before publishing the index that makes it visible.
+        sync_directory(&pack_dir)?;
+        file_util::persist_content_addressed_temp_file(index_temp, index_path)?;
+        sync_directory(&pack_dir)
     })();
-    let write_result = match write_result {
-        Ok(()) => writer.take().unwrap().finish().map(drop),
-        Err(err) => {
-            // Close the pipe so index-pack doesn't wait forever after a write error.
-            drop(writer.take());
-            Err(err)
-        }
-    };
-    let output = child
-        .wait_with_output()
-        .map_err(|err| BackendError::WriteObject {
-            object_type: "pack",
-            source: Box::new(err),
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(BackendError::WriteObject {
-            object_type: "pack",
-            source: io::Error::other(format!("git index-pack failed: {stderr}")).into(),
-        });
-    }
-    write_result.map_err(|err| BackendError::WriteObject {
+    result.map_err(|err| BackendError::WriteObject {
         object_type: "pack",
         source: Box::new(err),
     })
@@ -742,8 +821,7 @@ fn flush_buffered_git_objects(
     object_ids: &[gix::hash::ObjectId],
     buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
     write_repos: &GitWriteRepoPool,
-    git_executable: &Path,
-    git_repo_path: &Path,
+    objects_dir: &Path,
 ) -> BackendResult<()> {
     let objects = {
         let buffered_objects = buffered_objects.lock().unwrap();
@@ -755,7 +833,7 @@ fn flush_buffered_git_objects(
     if objects.len() < MIN_BUFFERED_OBJECTS_PER_PACK {
         return write_buffered_git_objects_loose(&objects, write_repos);
     }
-    if let Err(pack_err) = write_buffered_git_pack(&objects, git_executable, git_repo_path) {
+    if let Err(pack_err) = write_buffered_git_pack(&objects, objects_dir) {
         // Preserve correctness if the batch writer fails. This is slower, but it
         // leaves every object reachable by the already-committed operation in the ODB.
         tracing::warn!(
@@ -790,16 +868,9 @@ fn flush_git_write_batch(
     commit_ids: &HashSet<CommitId>,
     buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
     write_repos: &GitWriteRepoPool,
-    git_executable: &Path,
-    git_repo_path: &Path,
+    objects_dir: &Path,
 ) -> BackendResult<()> {
-    flush_buffered_git_objects(
-        object_ids,
-        buffered_objects,
-        write_repos,
-        git_executable,
-        git_repo_path,
-    )?;
+    flush_buffered_git_objects(object_ids, buffered_objects, write_repos, objects_dir)?;
     if !commit_ids.is_empty() {
         write_repos.with_repo(|repo| {
             repo.edit_references(commit_ids.iter().map(to_no_gc_ref_update))
@@ -832,7 +903,7 @@ impl GitWriteBatchGuard {
             &self.cached_extra_metadata,
             &self.buffered_objects,
             &self.write_repos,
-            &self.git_executable,
+            &self.objects_dir,
             &self.git_repo_path,
         )
     }
@@ -857,7 +928,7 @@ impl GitWriteBatchGuard {
                 &self.cached_extra_metadata,
                 &self.buffered_objects,
                 &self.write_repos,
-                &self.git_executable,
+                &self.objects_dir,
                 &self.git_repo_path,
             )?;
         }
@@ -875,7 +946,7 @@ fn flush_active_git_write_batch(
     cached_extra_metadata: &Mutex<Option<Arc<ReadonlyTable>>>,
     buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
     write_repos: &GitWriteRepoPool,
-    git_executable: &Path,
+    objects_dir: &Path,
     git_repo_path: &Path,
 ) -> BackendResult<()> {
     let mut state = state.lock().unwrap();
@@ -887,7 +958,7 @@ fn flush_active_git_write_batch(
         cached_extra_metadata,
         buffered_objects,
         write_repos,
-        git_executable,
+        objects_dir,
         git_repo_path,
     )
 }
@@ -959,7 +1030,7 @@ impl GitBackend {
             cached_extra_metadata: self.cached_extra_metadata.clone(),
             buffered_objects: self.buffered_objects.clone(),
             write_repos: self.write_repos.clone(),
-            git_executable: self.git_executable.clone(),
+            objects_dir: self.objects_dir.clone(),
             git_repo_path: self.git_repo_path().to_owned(),
             finished: false,
         }
@@ -976,7 +1047,7 @@ impl GitBackend {
             &self.cached_extra_metadata,
             &self.buffered_objects,
             &self.write_repos,
-            &self.git_executable,
+            &self.objects_dir,
             self.git_repo_path(),
         )
     }
@@ -3192,11 +3263,27 @@ mod tests {
         );
         write_batch.flush()?;
         assert!(FileLock::try_lock(lock_path)?.is_none());
-        let pack_files = fs::read_dir(backend.objects_dir.join("pack"))?
+        let pack_dir = backend.objects_dir.join("pack");
+        let pack_files = fs::read_dir(&pack_dir)?
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension() == Some(OsStr::new("pack")))
-            .count();
-        assert_eq!(pack_files, 1);
+            .collect_vec();
+        let index_files = fs::read_dir(&pack_dir)?
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension() == Some(OsStr::new("idx")))
+            .collect_vec();
+        assert_eq!(pack_files.len(), 1);
+        assert_eq!(index_files.len(), 1);
+        assert_eq!(pack_files[0].file_stem(), index_files[0].file_stem());
+        let verify_output = Command::new(&backend.git_executable)
+            .arg("verify-pack")
+            .arg(&index_files[0])
+            .output()?;
+        assert!(
+            verify_output.status.success(),
+            "git verify-pack failed: {}",
+            String::from_utf8_lossy(&verify_output.stderr)
+        );
         let fresh_repo =
             gix::ThreadSafeRepository::open_opts(&git_repo_path, open_options())?.to_thread_local();
         let mut blob = fresh_repo.find_object(file_oid)?.try_into_blob()?;
@@ -3237,6 +3324,71 @@ mod tests {
             Merge::resolved(second_tree_id)
         );
         write_batch.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn git_pack_index_v2_layout() -> TestResult {
+        let small_id = gix::hash::ObjectId::from_hex(b"00112233445566778899aabbccddeeff00112233")?;
+        let large_id = gix::hash::ObjectId::from_hex(b"ffeeddccbbaa99887766554433221100ffeeddcc")?;
+        let pack_hash = gix::hash::ObjectId::from_hex(b"1234567890abcdef1234567890abcdef12345678")?;
+        let mut file = NamedTempFile::new()?;
+        write_git_pack_index(
+            vec![
+                GitPackIndexEntry {
+                    id: large_id,
+                    offset: 0x8000_0000,
+                    crc32: 0xfeed_beef,
+                },
+                GitPackIndexEntry {
+                    id: small_id,
+                    offset: 12,
+                    crc32: 0x1234_5678,
+                },
+            ],
+            &pack_hash,
+            file.as_file_mut(),
+        )?;
+        let bytes = fs::read(file.path())?;
+
+        let fanout_end = 8 + 256 * 4;
+        assert_eq!(&bytes[..8], b"\xfftOc\0\0\0\x02");
+        assert_eq!(
+            u32::from_be_bytes(bytes[fanout_end - 4..fanout_end].try_into()?),
+            2
+        );
+        let ids_end = fanout_end + 2 * HASH_LENGTH;
+        assert_eq!(
+            &bytes[fanout_end..fanout_end + HASH_LENGTH],
+            small_id.as_bytes()
+        );
+        assert_eq!(
+            &bytes[fanout_end + HASH_LENGTH..ids_end],
+            large_id.as_bytes()
+        );
+        let crc_end = ids_end + 2 * 4;
+        assert_eq!(
+            &bytes[ids_end..crc_end],
+            b"\x12\x34\x56\x78\xfe\xed\xbe\xef"
+        );
+        let offsets_end = crc_end + 2 * 4;
+        assert_eq!(&bytes[crc_end..offsets_end], b"\0\0\0\x0c\x80\0\0\0");
+        assert_eq!(
+            &bytes[offsets_end..offsets_end + 8],
+            &0x8000_0000_u64.to_be_bytes()
+        );
+        let pack_hash_start = offsets_end + 8;
+        assert_eq!(
+            &bytes[pack_hash_start..pack_hash_start + HASH_LENGTH],
+            pack_hash.as_bytes()
+        );
+        let index_hash_start = pack_hash_start + HASH_LENGTH;
+        let mut hasher = gix::hash::hasher(pack_hash.kind());
+        hasher.update(&bytes[..index_hash_start]);
+        assert_eq!(
+            &bytes[index_hash_start..],
+            hasher.try_finalize()?.as_bytes()
+        );
         Ok(())
     }
 
