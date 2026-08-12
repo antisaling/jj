@@ -112,7 +112,7 @@ impl Backend for SecretBackend {
     }
 
     fn concurrency(&self) -> usize {
-        1
+        self.inner.concurrency()
     }
 
     async fn read_file(

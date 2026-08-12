@@ -58,7 +58,7 @@ pub struct Store {
     backend: Box<dyn Backend>,
     signer: Signer,
     commit_cache: Mutex<CLruCache<CommitId, Arc<backend::Commit>>>,
-    tree_cache: Mutex<CLruCache<(RepoPathBuf, TreeId), Arc<backend::Tree>>>,
+    tree_cache: Mutex<CLruCache<TreeId, Arc<backend::Tree>>>,
     merge_options: MergeOptions,
 }
 
@@ -199,17 +199,16 @@ impl Store {
         dir: &RepoPath,
         id: &TreeId,
     ) -> BackendResult<Arc<backend::Tree>> {
-        let key = (dir.to_owned(), id.clone());
         {
             let mut locked_cache = self.tree_cache.lock().unwrap();
-            if let Some(data) = locked_cache.get(&key).cloned() {
+            if let Some(data) = locked_cache.get(id).cloned() {
                 return Ok(data);
             }
         }
         let data = self.backend.read_tree(dir, id).await?;
         let data = Arc::new(data);
         let mut locked_cache = self.tree_cache.lock().unwrap();
-        locked_cache.put(key, data.clone());
+        locked_cache.put(id.clone(), data.clone());
         Ok(data)
     }
 
@@ -222,7 +221,7 @@ impl Store {
         let data = Arc::new(tree);
         {
             let mut locked_cache = self.tree_cache.lock().unwrap();
-            locked_cache.put((path.to_owned(), tree_id.clone()), data.clone());
+            locked_cache.put(tree_id.clone(), data.clone());
         }
 
         Ok(Tree::new(self.clone(), path.to_owned(), tree_id, data))

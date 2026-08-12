@@ -36,6 +36,7 @@ use async_trait::async_trait;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
+use futures::channel::oneshot;
 use futures::io::Cursor;
 use futures::stream::BoxStream;
 use gix::bstr::BString;
@@ -95,6 +96,7 @@ use crate::stacked_table::TableStore;
 use crate::stacked_table::TableStoreError;
 
 const CHANGE_ID_LENGTH: usize = 16;
+const GIT_TREE_READ_CONCURRENCY: usize = 4;
 /// Ref namespace used only for preventing GC.
 const NO_GC_REF_NAMESPACE: &str = "refs/jj/keep/";
 
@@ -1303,6 +1305,67 @@ impl Debug for GitBackend {
     }
 }
 
+fn read_tree_from_git_repo(
+    base_repo: &gix::ThreadSafeRepository,
+    id: &TreeId,
+    git_tree_id: gix::ObjectId,
+) -> BackendResult<Tree> {
+    let mut repo = base_repo.to_thread_local();
+    repo.objects.refresh_never();
+    let git_tree = repo
+        .find_object(git_tree_id)
+        .map_err(|err| map_not_found_err(err, id))?
+        .try_into_tree()
+        .map_err(|err| to_read_object_err(err, id))?;
+    let mut entries: Vec<_> = git_tree
+        .iter()
+        .map(|entry| -> BackendResult<_> {
+            let entry = entry.map_err(|err| to_read_object_err(err, id))?;
+            let name = RepoPathComponentBuf::new(
+                str::from_utf8(entry.filename()).map_err(|err| to_invalid_utf8_err(err, id))?,
+            )
+            .unwrap();
+            let value = match entry.mode().kind() {
+                gix::object::tree::EntryKind::Tree => {
+                    let id = TreeId::from_bytes(entry.oid().as_bytes());
+                    TreeValue::Tree(id)
+                }
+                gix::object::tree::EntryKind::Blob => {
+                    let id = FileId::from_bytes(entry.oid().as_bytes());
+                    TreeValue::File {
+                        id,
+                        executable: false,
+                        copy_id: CopyId::placeholder(),
+                    }
+                }
+                gix::object::tree::EntryKind::BlobExecutable => {
+                    let id = FileId::from_bytes(entry.oid().as_bytes());
+                    TreeValue::File {
+                        id,
+                        executable: true,
+                        copy_id: CopyId::placeholder(),
+                    }
+                }
+                gix::object::tree::EntryKind::Link => {
+                    let id = SymlinkId::from_bytes(entry.oid().as_bytes());
+                    TreeValue::Symlink(id)
+                }
+                gix::object::tree::EntryKind::Commit => {
+                    let id = CommitId::from_bytes(entry.oid().as_bytes());
+                    TreeValue::GitSubmodule(id)
+                }
+            };
+            Ok((name, value))
+        })
+        .try_collect()?;
+    // While Git tree entries are sorted, the rule is slightly different.
+    // Directory names are sorted as if they had trailing "/".
+    if !entries.is_sorted_by_key(|(name, _)| name) {
+        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    }
+    Ok(Tree::from_sorted_entries(entries))
+}
+
 #[async_trait]
 impl Backend for GitBackend {
     fn name(&self) -> &str {
@@ -1330,7 +1393,7 @@ impl Backend for GitBackend {
     }
 
     fn concurrency(&self) -> usize {
-        1
+        GIT_TREE_READ_CONCURRENCY
     }
 
     async fn read_file(
@@ -1394,61 +1457,30 @@ impl Backend for GitBackend {
         if id == &self.empty_tree_id {
             return Ok(Tree::default());
         }
-
-        let locked_repo = self.lock_git_repo();
-        let git_tree_id = validate_git_object_id(&locked_repo, id)?;
-        let git_tree = locked_repo
-            .find_object(git_tree_id)
-            .map_err(|err| map_not_found_err(err, id))?
-            .try_into_tree()
-            .map_err(|err| to_read_object_err(err, id))?;
-        let mut entries: Vec<_> = git_tree
-            .iter()
-            .map(|entry| -> BackendResult<_> {
-                let entry = entry.map_err(|err| to_read_object_err(err, id))?;
-                let name = RepoPathComponentBuf::new(
-                    str::from_utf8(entry.filename()).map_err(|err| to_invalid_utf8_err(err, id))?,
-                )
-                .unwrap();
-                let value = match entry.mode().kind() {
-                    gix::object::tree::EntryKind::Tree => {
-                        let id = TreeId::from_bytes(entry.oid().as_bytes());
-                        TreeValue::Tree(id)
-                    }
-                    gix::object::tree::EntryKind::Blob => {
-                        let id = FileId::from_bytes(entry.oid().as_bytes());
-                        TreeValue::File {
-                            id,
-                            executable: false,
-                            copy_id: CopyId::placeholder(),
-                        }
-                    }
-                    gix::object::tree::EntryKind::BlobExecutable => {
-                        let id = FileId::from_bytes(entry.oid().as_bytes());
-                        TreeValue::File {
-                            id,
-                            executable: true,
-                            copy_id: CopyId::placeholder(),
-                        }
-                    }
-                    gix::object::tree::EntryKind::Link => {
-                        let id = SymlinkId::from_bytes(entry.oid().as_bytes());
-                        TreeValue::Symlink(id)
-                    }
-                    gix::object::tree::EntryKind::Commit => {
-                        let id = CommitId::from_bytes(entry.oid().as_bytes());
-                        TreeValue::GitSubmodule(id)
-                    }
-                };
-                Ok((name, value))
-            })
-            .try_collect()?;
-        // While Git tree entries are sorted, the rule is slightly different.
-        // Directory names are sorted as if they had trailing "/".
-        if !entries.is_sorted_by_key(|(name, _)| name) {
-            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        // File snapshotting already runs on Rayon workers. Blocking one of
+        // those workers while waiting for another job on the same pool can
+        // deadlock when all workers reach this path at once.
+        if rayon::current_thread_index().is_some() {
+            let repo = self.base_repo.to_thread_local();
+            let git_tree_id = validate_git_object_id(&repo, id)?;
+            return read_tree_from_git_repo(&self.base_repo, id, git_tree_id);
         }
-        Ok(Tree::from_sorted_entries(entries))
+
+        let git_tree_id = {
+            let locked_repo = self.lock_git_repo();
+            validate_git_object_id(&locked_repo, id)?
+        };
+
+        let base_repo = self.base_repo.clone();
+        let id = id.clone();
+        let (sender, receiver) = oneshot::channel();
+        rayon::spawn(move || {
+            let result = read_tree_from_git_repo(&base_repo, &id, git_tree_id);
+            drop(sender.send(result));
+        });
+        receiver.await.map_err(|_| {
+            BackendError::Other(Box::new(std::io::Error::other("Git tree read task exited")))
+        })?
     }
 
     async fn write_tree(&self, _path: &RepoPath, contents: &Tree) -> BackendResult<TreeId> {
