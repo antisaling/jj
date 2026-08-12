@@ -2830,6 +2830,7 @@ dependencies = [
  "rustix",
  "rustversion",
  "serde",
+ "sha1",
  "smallvec",
  "strsim",
  "tempfile",

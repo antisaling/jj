@@ -16,7 +16,7 @@
 
 #![warn(missing_docs)]
 #![deny(unused_must_use)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod absorb;
 pub mod annotate;

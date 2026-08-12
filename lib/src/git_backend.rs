@@ -52,6 +52,8 @@ use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
 use prost::Message as _;
+#[cfg(not(target_vendor = "apple"))]
+use sha1::Digest as _;
 use smallvec::SmallVec;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -1487,6 +1489,81 @@ impl GitBackend {
     }
 }
 
+/// Computes a Git SHA-1 without collision detection.
+///
+/// This is only used for tree objects synthesized from parsed [`Tree`] values. Blobs and
+/// commits can contain arbitrary input and continue to use gix's collision-checking hasher.
+fn compute_synthesized_tree_hash(bytes: &[u8]) -> gix::hash::ObjectId {
+    #[cfg(target_vendor = "apple")]
+    {
+        compute_synthesized_tree_hash_common_crypto(bytes)
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(gix::objs::encode::loose_header(
+            gix::objs::Kind::Tree,
+            bytes.len() as u64,
+        ));
+        hasher.update(bytes);
+        gix::hash::ObjectId::from_bytes_or_panic(&hasher.finalize())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(unsafe_code)]
+fn compute_synthesized_tree_hash_common_crypto(bytes: &[u8]) -> gix::hash::ObjectId {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Sha1Context {
+        state: [u32; 5],
+        bit_count: [u32; 2],
+        data: [u32; 16],
+        buffered_len: std::ffi::c_int,
+    }
+
+    #[link(name = "System", kind = "dylib")]
+    unsafe extern "C" {
+        #[link_name = "CC_SHA1_Init"]
+        fn cc_sha1_init(context: *mut Sha1Context) -> std::ffi::c_int;
+        #[link_name = "CC_SHA1_Update"]
+        fn cc_sha1_update(
+            context: *mut Sha1Context,
+            data: *const std::ffi::c_void,
+            len: u32,
+        ) -> std::ffi::c_int;
+        #[link_name = "CC_SHA1_Final"]
+        fn cc_sha1_final(digest: *mut u8, context: *mut Sha1Context) -> std::ffi::c_int;
+    }
+
+    fn update(context: &mut Sha1Context, bytes: &[u8]) {
+        for chunk in bytes.chunks(u32::MAX as usize) {
+            // SAFETY: `context` and `chunk` remain valid for the duration of the call.
+            let success =
+                unsafe { cc_sha1_update(context, chunk.as_ptr().cast(), chunk.len() as u32) };
+            assert_eq!(success, 1);
+        }
+    }
+
+    let mut context = Sha1Context::default();
+    // SAFETY: `context` points to writable storage with the layout declared by CommonCrypto.
+    assert_eq!(unsafe { cc_sha1_init(&raw mut context) }, 1);
+    update(
+        &mut context,
+        &gix::objs::encode::loose_header(gix::objs::Kind::Tree, bytes.len() as u64),
+    );
+    update(&mut context, bytes);
+
+    let mut digest = [0; 20];
+    // SAFETY: `digest` has SHA-1's required 20 bytes and `context` is initialized.
+    assert_eq!(
+        unsafe { cc_sha1_final(digest.as_mut_ptr(), &raw mut context) },
+        1
+    );
+    gix::hash::ObjectId::from_bytes_or_panic(&digest)
+}
+
 fn compress_git_object_data(bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut writer =
         gix::zlib::stream::deflate::Write::new(Vec::new(), gix::zlib::Compression::DEFAULT);
@@ -2410,15 +2487,7 @@ impl Backend for GitBackend {
             object_type: "tree",
             source: Box::new(err),
         })?;
-        let oid = gix::objs::compute_hash(
-            self.base_repo.objects.object_hash(),
-            gix::objs::Kind::Tree,
-            &bytes,
-        )
-        .map_err(|err| BackendError::WriteObject {
-            object_type: "tree",
-            source: Box::new(err),
-        })?;
+        let oid = compute_synthesized_tree_hash(&bytes);
         let write_result = if rayon::current_thread_index().is_some() {
             write_or_buffer_object_on_pool(
                 &self.objects_dir,
@@ -3021,6 +3090,21 @@ mod tests {
         expected.extend_from_slice(b"40000 foo\0");
         expected.extend_from_slice(&[1; SHA1_LENGTH]);
         assert_eq!(bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn synthesized_tree_hash_matches_collision_checked_hash() -> TestResult {
+        let large_tree = vec![0x5a; 128 * 1024];
+        for bytes in [&[][..], b"100644 file\0object-id".as_slice(), &large_tree] {
+            let expected =
+                gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Tree, bytes)?;
+            assert_eq!(compute_synthesized_tree_hash(bytes), expected);
+        }
+        assert_eq!(
+            compute_synthesized_tree_hash(&[]),
+            gix::ObjectId::from_hex(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904")?
+        );
         Ok(())
     }
 
