@@ -24,6 +24,7 @@ categories = ["development-tools"]
 keywords = ["VCS", "DVCS", "SCM", "Git", "Mercurial"]
 
 [workspace.dependencies]
+ahash = "0.8.12"
 ansi-to-tui = "8.0.1"
 anstream = "1.0.0"
 assert_cmd = "2.2.2"

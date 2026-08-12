@@ -2789,6 +2789,7 @@ dependencies = [
 name = "jj-lib"
 version = "0.45.1"
 dependencies = [
+ "ahash",
  "assert_matches",
  "async-trait",
  "blake2",

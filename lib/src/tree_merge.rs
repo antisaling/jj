@@ -16,11 +16,11 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::iter::zip;
 use std::sync::Arc;
 use std::vec;
 
+use ahash::AHashMap;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
@@ -97,9 +97,8 @@ struct MergedTreeInput {
     same_as_input: Vec<bool>,
     resolved: BTreeMap<RepoPathComponentBuf, TreeValue>,
     /// Entries that we're currently waiting for data for in order to resolve
-    /// them. When this set becomes empty, we're ready to write the tree(s).
-    pending_lookup: HashSet<RepoPathComponentBuf>,
-    pending_inputs: BTreeMap<RepoPathComponentBuf, MergedTreeValue>,
+    /// them. When this map becomes empty, we're ready to write the tree(s).
+    pending_inputs: AHashMap<RepoPathComponentBuf, MergedTreeValue>,
     conflicts: BTreeMap<RepoPathComponentBuf, MergedTreeValue>,
 }
 
@@ -113,8 +112,7 @@ impl MergedTreeInput {
             input_trees,
             same_as_input,
             resolved,
-            pending_lookup: HashSet::new(),
-            pending_inputs: BTreeMap::new(),
+            pending_inputs: AHashMap::new(),
             conflicts: BTreeMap::new(),
         }
     }
@@ -125,8 +123,6 @@ impl MergedTreeInput {
         value: MergedTreeValue,
         same_change: SameChange,
     ) {
-        let was_pending = self.pending_lookup.remove(&basename);
-        assert!(was_pending, "No pending lookup for {basename:?}");
         let input_value = self
             .pending_inputs
             .remove(&basename)
@@ -158,7 +154,6 @@ impl MergedTreeInput {
     }
 
     fn into_backend_trees(self) -> (Merge<backend::Tree>, Merge<Option<Tree>>) {
-        assert!(self.pending_lookup.is_empty());
         assert!(self.pending_inputs.is_empty());
         let input_trees = self.input_trees;
 
@@ -323,10 +318,7 @@ impl TreeMerger {
             MergedTreeInput::new(tree, same_as_input, resolved.into_iter().collect());
         for (basename, value) in non_trivial {
             let path = dir.join(&basename);
-            unmerged_tree
-                .pending_inputs
-                .insert(basename.clone(), value.clone());
-            unmerged_tree.pending_lookup.insert(basename);
+            unmerged_tree.pending_inputs.insert(basename, value.clone());
             if value.is_tree() {
                 self.enqueue_tree_read(path, value);
             } else {
@@ -387,7 +379,7 @@ impl TreeMerger {
         tree.mark_completed(basename.to_owned(), value, same_change);
         // If all entries in this tree have been processed (either resolved or still a
         // conflict), schedule the writing of the tree(s) to the backend.
-        if tree.pending_lookup.is_empty() {
+        if tree.pending_inputs.is_empty() {
             let tree = self.trees_to_resolve.remove(dir).unwrap();
             let (backend_trees, reusable_trees) = tree.into_backend_trees();
             self.enqueue_tree_write(dir.to_owned(), reusable_trees, backend_trees);

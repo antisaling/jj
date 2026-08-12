@@ -16,7 +16,6 @@
 //! some common types of merged values.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -28,6 +27,7 @@ use std::ops::Deref;
 use std::slice;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use futures::future::try_join_all;
 use itertools::Itertools as _;
 use smallvec::SmallVec;
@@ -161,31 +161,61 @@ where
 
     // Number of occurrences of each value, with positive indexes counted as +1 and
     // negative as -1, thereby letting positive and negative terms with the same
-    // value (i.e. key in the map) cancel each other.
-    let mut counts: HashMap<&T, i32> = HashMap::new();
+    // value cancel each other. Most large tree merges contain only a few distinct
+    // values, so avoid hashing them unless the active set grows beyond the inline
+    // counter.
+    const INLINE_COUNT_CAPACITY: usize = 4;
+    let mut inline_counts: SmallVec<[(&T, i32); INLINE_COUNT_CAPACITY]> = SmallVec::new();
+    let mut hashed_counts: Option<AHashMap<&T, i32>> = None;
     for (value, n) in zip(values, [1, -1].into_iter().cycle()) {
-        counts.entry(value).and_modify(|e| *e += n).or_insert(n);
+        if let Some(counts) = &mut hashed_counts {
+            let count = counts.entry(value).or_insert(0);
+            *count += n;
+            if *count == 0 {
+                counts.remove(value);
+            }
+        } else if let Some(index) = inline_counts.iter().position(|(key, _)| *key == value) {
+            inline_counts[index].1 += n;
+            if inline_counts[index].1 == 0 {
+                inline_counts.swap_remove(index);
+            }
+        } else if inline_counts.len() < INLINE_COUNT_CAPACITY {
+            inline_counts.push((value, n));
+        } else {
+            let mut counts = AHashMap::with_capacity(INLINE_COUNT_CAPACITY * 2);
+            counts.extend(inline_counts.drain(..));
+            counts.insert(value, n);
+            hashed_counts = Some(counts);
+        }
     }
 
-    // Collect non-zero value. Values with a count of 0 means that they have
-    // canceled out.
-    counts.retain(|_, count| *count != 0);
-    if counts.len() == 1 {
-        // If there is a single value with a count of 1 left, then that is the result.
-        let (value, count) = counts.into_iter().next().unwrap();
-        assert_eq!(count, 1);
-        Some(value)
-    } else if counts.len() == 2 && same_change == SameChange::Accept {
-        // All sides made the same change.
-        let [(value1, count1), (value2, count2)] = counts.into_iter().next_array().unwrap();
-        assert_eq!(count1 + count2, 1);
-        if count1 > 0 {
-            Some(value1)
+    fn resolve_counts<'a, T>(
+        mut counts: impl ExactSizeIterator<Item = (&'a T, i32)>,
+        same_change: SameChange,
+    ) -> Option<&'a T> {
+        if counts.len() == 1 {
+            // If there is a single value with a count of 1 left, then that is the result.
+            let (value, count) = counts.next().unwrap();
+            assert_eq!(count, 1);
+            Some(value)
+        } else if counts.len() == 2 && same_change == SameChange::Accept {
+            // All sides made the same change.
+            let [(value1, count1), (value2, count2)] = counts.next_array().unwrap();
+            assert_eq!(count1 + count2, 1);
+            if count1 > 0 {
+                Some(value1)
+            } else {
+                Some(value2)
+            }
         } else {
-            Some(value2)
+            None
         }
+    }
+
+    if let Some(counts) = hashed_counts {
+        resolve_counts(counts.into_iter(), same_change)
     } else {
-        None
+        resolve_counts(inline_counts.into_iter(), same_change)
     }
 }
 
@@ -395,7 +425,7 @@ impl<T> Merge<T> {
         T: Eq + Hash,
     {
         let unsimplified_len = self.values.len();
-        let mut remove_indices_by_value: HashMap<&T, VecDeque<usize>> = HashMap::new();
+        let mut remove_indices_by_value: AHashMap<&T, VecDeque<usize>> = AHashMap::new();
         for remove_index in (1..unsimplified_len).step_by(2) {
             remove_indices_by_value
                 .entry(&self.values[remove_index])

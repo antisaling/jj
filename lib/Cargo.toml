@@ -25,6 +25,7 @@ include = [
 name = "runner"
 
 [dependencies]
+ahash = { workspace = true }
 async-trait = { workspace = true }
 blake2 = { workspace = true }
 bstr = { workspace = true }
