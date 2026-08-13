@@ -48,6 +48,7 @@ use gix::objs::CommitRefIter;
 use gix::objs::Write as _;
 use gix::objs::WriteTo as _;
 use gix::objs::commit::signature_field_name;
+use gix::prelude::Find as _;
 use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
@@ -475,18 +476,29 @@ impl GitWriteRepoPool {
         self.with_repo(|repo| {
             let refresh_mode = repo.objects.refresh_mode();
             repo.objects.refresh = Default::default();
-            // Collecting prefix candidates prevents an early return when `id` was
-            // already present before this pack was written. The lookup must exhaust
-            // the known indices, which makes gix refresh its shared ODB state from
-            // disk and publish the new pack to every repository handle.
-            let mut candidates = HashSet::new();
+            // An exact lookup for Git's reserved null ID is guaranteed to miss. That
+            // makes gix exhaust the known pack indices, refresh its shared ODB state
+            // from disk, and publish the new pack to every repository handle. Unlike
+            // prefix lookup with candidate collection, this only probes one loose
+            // object path instead of enumerating the entire loose-object database.
+            let mut buffer = Vec::new();
             let result = repo
                 .objects
-                .lookup_prefix(id.into(), Some(&mut candidates))
+                .try_find(repo.object_hash().null_ref(), &mut buffer)
                 .map(|_| ())
                 .map_err(|err| BackendError::WriteObject {
                     object_type: "pack",
-                    source: Box::new(err),
+                    source: err,
+                })
+                .and_then(|()| {
+                    // Do not publish an operation until a newly packed object can be
+                    // read through the refreshed handle.
+                    repo.find_object(id)
+                        .map(|_| ())
+                        .map_err(|err| BackendError::WriteObject {
+                            object_type: "pack",
+                            source: Box::new(err),
+                        })
                 });
             repo.objects.refresh = refresh_mode;
             result
