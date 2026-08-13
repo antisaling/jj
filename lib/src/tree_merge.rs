@@ -15,6 +15,7 @@
 //! Merge trees by recursing into entries (subtrees, files)
 
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::iter::zip;
 use std::sync::Arc;
@@ -25,7 +26,6 @@ use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use itertools::Itertools as _;
 
 use crate::backend;
 use crate::backend::BackendResult;
@@ -93,12 +93,144 @@ pub async fn merge_trees(store: &Arc<Store>, merge: Merge<TreeId>) -> BackendRes
 
 struct MergedTreeInput {
     input_trees: Merge<Tree>,
+    /// Whether each merge term is identical to the corresponding input tree.
     same_as_input: Vec<bool>,
     resolved: BTreeMap<RepoPathComponentBuf, TreeValue>,
     /// Entries that we're currently waiting for data for in order to resolve
     /// them. When this map becomes empty, we're ready to write the tree(s).
     pending_inputs: AHashMap<RepoPathComponentBuf, MergedTreeValue>,
     conflicts: BTreeMap<RepoPathComponentBuf, MergedTreeValue>,
+}
+
+fn build_conflicted_backend_trees(
+    resolved: BTreeMap<RepoPathComponentBuf, TreeValue>,
+    conflicts: BTreeMap<RepoPathComponentBuf, MergedTreeValue>,
+    build_terms: &[bool],
+) -> Vec<backend::Tree> {
+    let resolved_len = resolved.len();
+    let active_terms: Vec<_> = build_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(index, build)| build.then_some(index))
+        .collect();
+    let mut term_entries: Vec<Option<Vec<_>>> = build_terms
+        .iter()
+        .map(|build| build.then(|| Vec::with_capacity(resolved_len)))
+        .collect();
+
+    let mut resolved = resolved.into_iter().peekable();
+    let mut conflicts = conflicts.into_iter().peekable();
+    loop {
+        let take_resolved = match (resolved.peek(), conflicts.peek()) {
+            (Some((resolved_name, _)), Some((conflict_name, _))) => {
+                match resolved_name.cmp(conflict_name) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => unreachable!("entry cannot be both resolved and conflicted"),
+                }
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+
+        if take_resolved {
+            let (basename, value) = resolved.next().unwrap();
+            if let Some((&last_term, other_terms)) = active_terms.split_last() {
+                for &term in other_terms {
+                    term_entries[term]
+                        .as_mut()
+                        .unwrap()
+                        .push((basename.clone(), value.clone()));
+                }
+                term_entries[last_term]
+                    .as_mut()
+                    .unwrap()
+                    .push((basename, value));
+            }
+        } else {
+            let (basename, conflict) = conflicts.next().unwrap();
+            assert_eq!(conflict.iter().count(), build_terms.len());
+            let mut values: Vec<_> = conflict.into_iter().collect();
+            let Some(last_term) = active_terms
+                .iter()
+                .rev()
+                .copied()
+                .find(|&term| values[term].is_some())
+            else {
+                continue;
+            };
+            let mut basename = Some(basename);
+            for &term in &active_terms {
+                let Some(value) = values[term].take() else {
+                    continue;
+                };
+                let term_basename = if term == last_term {
+                    basename.take().unwrap()
+                } else {
+                    basename.as_ref().unwrap().clone()
+                };
+                term_entries[term]
+                    .as_mut()
+                    .unwrap()
+                    .push((term_basename, value));
+            }
+        }
+    }
+
+    term_entries
+        .into_iter()
+        .map(|entries| backend::Tree::from_sorted_entries(entries.unwrap_or_default()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::SymlinkId;
+
+    fn name(value: &str) -> RepoPathComponentBuf {
+        RepoPathComponentBuf::new(value).unwrap()
+    }
+
+    fn value(id: u8) -> TreeValue {
+        TreeValue::Symlink(SymlinkId::new(vec![id]))
+    }
+
+    #[test]
+    fn test_build_conflicted_backend_trees() {
+        let resolved = BTreeMap::from([(name("b"), value(2)), (name("d"), value(4))]);
+        let conflicts = BTreeMap::from([
+            (
+                name("a"),
+                Merge::from_vec(vec![Some(value(10)), None, Some(value(12))]),
+            ),
+            (
+                name("c"),
+                Merge::from_vec(vec![None, Some(value(21)), Some(value(22))]),
+            ),
+        ]);
+
+        let trees = build_conflicted_backend_trees(resolved, conflicts, &[true, false, true]);
+
+        assert_eq!(
+            trees,
+            vec![
+                backend::Tree::from_sorted_entries(vec![
+                    (name("a"), value(10)),
+                    (name("b"), value(2)),
+                    (name("d"), value(4)),
+                ]),
+                backend::Tree::default(),
+                backend::Tree::from_sorted_entries(vec![
+                    (name("a"), value(12)),
+                    (name("b"), value(2)),
+                    (name("c"), value(22)),
+                    (name("d"), value(4)),
+                ]),
+            ]
+        );
+    }
 }
 
 impl MergedTreeInput {
@@ -156,50 +288,35 @@ impl MergedTreeInput {
         assert!(self.pending_inputs.is_empty());
         let input_trees = self.input_trees;
 
-        fn by_name(
-            (name1, _): &(RepoPathComponentBuf, TreeValue),
-            (name2, _): &(RepoPathComponentBuf, TreeValue),
-        ) -> bool {
-            name1 < name2
-        }
-
         if self.conflicts.is_empty() {
-            let all_entries = self.resolved.into_iter().collect();
             let reusable_tree = self
                 .same_as_input
                 .into_iter()
                 .zip(input_trees)
                 .find_map(|(same_as_input, tree)| same_as_input.then_some(tree));
+            let backend_tree = if reusable_tree.is_some() {
+                backend::Tree::default()
+            } else {
+                backend::Tree::from_sorted_entries(self.resolved.into_iter().collect())
+            };
             (
-                Merge::resolved(backend::Tree::from_sorted_entries(all_entries)),
+                Merge::resolved(backend_tree),
                 Merge::resolved(reusable_tree),
             )
         } else {
-            // Create a Merge with the conflict entries for each side.
-            let mut conflict_entries = self.conflicts.first_key_value().unwrap().1.map(|_| vec![]);
-            for (basename, value) in self.conflicts {
-                assert_eq!(value.num_sides(), conflict_entries.num_sides());
-                for (entries, value) in zip(&mut conflict_entries, value) {
-                    if let Some(value) = value {
-                        entries.push((basename.clone(), value));
-                    }
-                }
-            }
-
-            let mut backend_trees = vec![];
-            for entries in conflict_entries {
-                let backend_tree = backend::Tree::from_sorted_entries(
-                    self.resolved
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .merge_by(entries, by_name)
-                        .collect(),
-                );
-                backend_trees.push(backend_tree);
-            }
-            // Conflict terms can be simplified or reordered while recursing. Avoid
-            // positional reuse unless the merge stayed resolved.
-            let reusable_trees: Vec<_> = backend_trees.iter().map(|_| None).collect();
+            let output_num_terms = self.conflicts.first_key_value().unwrap().1.iter().count();
+            let reusable_trees: Vec<_> = if output_num_terms == self.same_as_input.len() {
+                zip(self.same_as_input, input_trees)
+                    .map(|(same_as_input, tree)| same_as_input.then_some(tree))
+                    .collect()
+            } else {
+                // A nested merge simplified the terms, so output terms no longer have
+                // positional correspondence with the input trees.
+                vec![None; output_num_terms]
+            };
+            let build_terms: Vec<_> = reusable_trees.iter().map(Option::is_none).collect();
+            let backend_trees =
+                build_conflicted_backend_trees(self.resolved, self.conflicts, &build_terms);
             (
                 Merge::from_vec(backend_trees),
                 Merge::from_vec(reusable_trees),
@@ -290,7 +407,7 @@ impl TreeMerger {
         let same_change = self.store.merge_options().same_change;
         let mut resolved = vec![];
         let mut non_trivial = vec![];
-        let mut same_as_input = vec![true; tree.num_sides()];
+        let mut same_as_input = vec![true; tree.iter().count()];
         for (basename, path_merge) in all_merged_tree_entries(&tree) {
             if let Some(value) = path_merge.resolve_trivial(same_change) {
                 for (same_as_input, input_value) in same_as_input.iter_mut().zip(path_merge.iter())
