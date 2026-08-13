@@ -196,3 +196,4 @@ opt-level = 3
 [profile.release]
 strip = "debuginfo"
 codegen-units = 1
+incremental = true
