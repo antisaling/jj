@@ -279,6 +279,12 @@ impl GitObjectWriteTracker {
         self.completed.notify_all();
         result
     }
+
+    fn mark_written_many(&self, oids: impl IntoIterator<Item = gix::hash::ObjectId>) {
+        let mut state = self.state.lock().unwrap();
+        state.written.extend(oids);
+        self.completed.notify_all();
+    }
 }
 
 impl SharedGitObjectCache {
@@ -1650,6 +1656,25 @@ fn buffer_git_object(
     Ok(())
 }
 
+fn try_buffer_git_objects(
+    write_batch_state: &Mutex<GitWriteBatchState>,
+    buffered_objects: &Mutex<HashMap<gix::hash::ObjectId, Arc<BufferedGitObject>>>,
+    objects: Vec<(gix::hash::ObjectId, BufferedGitObject)>,
+) -> Result<(), Vec<(gix::hash::ObjectId, BufferedGitObject)>> {
+    let mut state = write_batch_state.lock().unwrap();
+    let Some(batch) = state.batch.as_mut() else {
+        return Err(objects);
+    };
+    let mut buffered_objects = buffered_objects.lock().unwrap();
+    for (oid, object) in objects {
+        if let std::collections::hash_map::Entry::Vacant(entry) = buffered_objects.entry(oid) {
+            entry.insert(Arc::new(object));
+            batch.object_ids.push(oid);
+        }
+    }
+    Ok(())
+}
+
 #[expect(clippy::too_many_arguments)]
 fn write_or_buffer_object_on_pool(
     objects_dir: &Path,
@@ -2537,24 +2562,105 @@ impl Backend for GitBackend {
     }
 
     async fn write_trees(&self, _path: &RepoPath, contents: &[Tree]) -> BackendResult<Vec<TreeId>> {
-        contents
+        let batch_active = self.write_batch_state.lock().unwrap().batch.is_some();
+        if !batch_active {
+            return contents
+                .into_par_iter()
+                .map(|contents| {
+                    let (bytes, oid) = serialize_and_hash_git_tree(contents)?;
+                    write_or_buffer_object_on_pool(
+                        &self.objects_dir,
+                        &self.written_objects,
+                        &self.write_repos,
+                        &self.write_batch_state,
+                        &self.buffered_objects,
+                        gix::objs::Kind::Tree,
+                        bytes,
+                        oid,
+                        "tree",
+                    )?;
+                    Ok(TreeId::from_bytes(oid.as_bytes()))
+                })
+                .collect();
+        }
+
+        // Tree rebases can produce thousands of trees at once. Prepare them in
+        // parallel, then publish the whole group under one set of shared-state
+        // locks instead of taking the write-tracker and object-map locks once
+        // per tree.
+        let serialized_trees: Vec<_> = contents
             .into_par_iter()
-            .map(|contents| {
-                let (bytes, oid) = serialize_and_hash_git_tree(contents)?;
-                write_or_buffer_object_on_pool(
-                    &self.objects_dir,
-                    &self.written_objects,
-                    &self.write_repos,
-                    &self.write_batch_state,
-                    &self.buffered_objects,
-                    gix::objs::Kind::Tree,
-                    bytes,
+            .map(serialize_and_hash_git_tree)
+            .collect::<BackendResult<_>>()?;
+        let tree_ids = serialized_trees
+            .iter()
+            .map(|(_, oid)| TreeId::from_bytes(oid.as_bytes()))
+            .collect_vec();
+
+        let (unique_oids, trees_to_buffer) = {
+            let buffered_objects = self.buffered_objects.lock().unwrap();
+            let mut seen = HashSet::with_capacity(serialized_trees.len());
+            let mut unique_oids = Vec::with_capacity(serialized_trees.len());
+            let mut trees_to_buffer = Vec::with_capacity(serialized_trees.len());
+            for (bytes, oid) in serialized_trees {
+                if seen.insert(oid) {
+                    unique_oids.push(oid);
+                    if !buffered_objects.contains_key(&oid) {
+                        trees_to_buffer.push((bytes, oid));
+                    }
+                }
+            }
+            (unique_oids, trees_to_buffer)
+        };
+        let prepared_objects = trees_to_buffer
+            .into_par_iter()
+            .map(|(data, oid)| {
+                let compressed_data =
+                    compress_git_object_data(&data).map_err(|err| BackendError::WriteObject {
+                        object_type: "tree",
+                        source: Box::new(err),
+                    })?;
+                Ok((
                     oid,
-                    "tree",
-                )?;
-                Ok(TreeId::from_bytes(oid.as_bytes()))
+                    BufferedGitObject {
+                        kind: gix::objs::Kind::Tree,
+                        data,
+                        compressed_data,
+                    },
+                ))
             })
-            .collect()
+            .collect::<BackendResult<Vec<_>>>()?;
+
+        let prepared_objects = match try_buffer_git_objects(
+            &self.write_batch_state,
+            &self.buffered_objects,
+            prepared_objects,
+        ) {
+            Ok(()) => {
+                // Buffered objects are readable before this notification, so
+                // waking a waiter racing with this batch is safe.
+                self.written_objects.mark_written_many(unique_oids);
+                return Ok(tree_ids);
+            }
+            Err(objects) => objects,
+        };
+
+        // The last batch guard can theoretically finish while trees are being
+        // prepared. Preserve the ordinary loose-object behavior in that race.
+        for (oid, object) in prepared_objects {
+            write_or_buffer_object_on_pool(
+                &self.objects_dir,
+                &self.written_objects,
+                &self.write_repos,
+                &self.write_batch_state,
+                &self.buffered_objects,
+                gix::objs::Kind::Tree,
+                object.data,
+                oid,
+                "tree",
+            )?;
+        }
+        Ok(tree_ids)
     }
 
     #[tracing::instrument(skip(self))]
@@ -3189,6 +3295,81 @@ mod tests {
     }
 
     #[test]
+    fn write_trees_deduplicates_batch_objects() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path);
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        let write_batch = backend.start_write_batch();
+        let file_id = backend
+            .write_file_bytes(RepoPath::root(), b"duplicate tree")
+            .block_on()?;
+        let tree = Tree::from_sorted_entries(vec![(
+            RepoPathComponentBuf::new("file")?,
+            TreeValue::File {
+                id: file_id,
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            },
+        )]);
+        let trees = vec![tree.clone(); 256];
+        let object_count_before = backend
+            .write_batch_state
+            .lock()
+            .unwrap()
+            .batch
+            .as_ref()
+            .unwrap()
+            .object_ids
+            .len();
+
+        let tree_ids = backend.write_trees(RepoPath::root(), &trees).block_on()?;
+        assert!(tree_ids.iter().all(|id| id == &tree_ids[0]));
+        let object_count_after = backend
+            .write_batch_state
+            .lock()
+            .unwrap()
+            .batch
+            .as_ref()
+            .unwrap()
+            .object_ids
+            .len();
+        assert_eq!(object_count_after, object_count_before + 1);
+
+        // The bulk tracker update makes a later individual write a no-op.
+        assert_eq!(
+            backend.write_tree(RepoPath::root(), &tree).block_on()?,
+            tree_ids[0]
+        );
+        assert_eq!(
+            backend
+                .write_batch_state
+                .lock()
+                .unwrap()
+                .batch
+                .as_ref()
+                .unwrap()
+                .object_ids
+                .len(),
+            object_count_after
+        );
+
+        write_batch.finish()?;
+        let reopened_backend = GitBackend::load(&settings, &store_path)?;
+        assert_eq!(
+            reopened_backend
+                .read_tree(RepoPath::root(), &tree_ids[0])
+                .block_on()?,
+            tree
+        );
+        Ok(())
+    }
+
+    #[test]
     fn git_gc_cruft_policy_is_explicit() {
         let keep_newer = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
         let command_args = |use_cruft| {
@@ -3289,6 +3470,39 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn bulk_write_tracking_wakes_concurrent_waiters() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let tracker = Arc::new(GitObjectWriteTracker::default());
+        let write_started = Arc::new(Barrier::new(2));
+        let release_write = Arc::new(Barrier::new(2));
+        let id = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let writer = {
+            let tracker = tracker.clone();
+            let write_started = write_started.clone();
+            let release_write = release_write.clone();
+            thread::spawn(move || {
+                tracker
+                    .write_once(id, || {
+                        write_started.wait();
+                        release_write.wait();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+
+        write_started.wait();
+        tracker.mark_written_many([id]);
+        tracker
+            .write_once(id, || panic!("published object should not be rewritten"))
+            .unwrap();
+        release_write.wait();
+        writer.join().unwrap();
     }
 
     #[test]
