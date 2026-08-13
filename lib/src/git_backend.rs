@@ -576,13 +576,19 @@ impl GitWriteRepoPool {
         self.with_repo(|repo| {
             let refresh_mode = repo.objects.refresh_mode();
             repo.objects.refresh = Default::default();
-            let result =
-                repo.find_object(id)
-                    .map(|_| ())
-                    .map_err(|err| BackendError::WriteObject {
-                        object_type: "pack",
-                        source: Box::new(err),
-                    });
+            // Collecting prefix candidates prevents an early return when `id` was
+            // already present before this pack was written. The lookup must exhaust
+            // the known indices, which makes gix refresh its shared ODB state from
+            // disk and publish the new pack to every repository handle.
+            let mut candidates = HashSet::new();
+            let result = repo
+                .objects
+                .lookup_prefix(id.into(), Some(&mut candidates))
+                .map(|_| ())
+                .map_err(|err| BackendError::WriteObject {
+                    object_type: "pack",
+                    source: Box::new(err),
+                });
             repo.objects.refresh = refresh_mode;
             result
         })
@@ -3899,16 +3905,38 @@ mod tests {
         let git_repo_path = temp_dir.path().join("git");
         let git_repo = git_init(&git_repo_path);
         let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+        let existing_contents = b"object written before batch";
+        let existing_file_id = backend
+            .write_file_bytes(RepoPath::root(), existing_contents)
+            .block_on()?;
+        drop(backend);
+
+        // Reopening resets the command-scoped write tracker. Writing the same object
+        // in a batch buffers it even though it already exists in the ODB.
+        let backend = GitBackend::load(&settings, &store_path)?;
+        let missing_file_id = FileId::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(
+            backend
+                .read_file_bytes(RepoPath::root(), &missing_file_id)
+                .block_on()
+                .is_err()
+        );
         let write_batch = backend.start_write_batch();
         let lock_path = backend.git_object_store_lock_path();
-        backend
-            .write_batch_state
-            .lock()
-            .unwrap()
-            .batch
-            .as_mut()
-            .unwrap()
-            .buffered_object_bytes = MAX_BUFFERED_GIT_OBJECT_BYTES;
+        assert_eq!(
+            backend
+                .write_file_bytes(RepoPath::root(), existing_contents)
+                .block_on()?,
+            existing_file_id
+        );
+        let mut state = backend.write_batch_state.lock().unwrap();
+        let batch = state.batch.as_mut().unwrap();
+        assert_eq!(
+            batch.object_ids,
+            [validate_git_object_id(&existing_file_id)?]
+        );
+        batch.buffered_object_bytes = MAX_BUFFERED_GIT_OBJECT_BYTES;
+        drop(state);
 
         let contents = vec![0x5a; MIN_BUFFERED_BYTES_PER_PACK];
         let file_id = backend
