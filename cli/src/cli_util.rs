@@ -1280,6 +1280,14 @@ impl WorkspaceCommandHelper {
         Ok(())
     }
 
+    #[cfg(feature = "git")]
+    fn flush_and_release_git_write_batch_object_store_lock(&mut self) -> Result<(), CommandError> {
+        if let Some(write_batch) = self._git_write_batch.as_mut() {
+            write_batch.flush_and_release_object_store_lock()?;
+        }
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     fn new(
         ui: &Ui,
@@ -2449,6 +2457,12 @@ to the current parents may contain changes from multiple commits.
                 .maybe_commit_transaction(tx, description)
                 .await?,
         );
+
+        // The working-copy lock can be acquired by another command while it
+        // is snapshotting. Do not hold the Git object-store lock while waiting
+        // for it, or the two commands can deadlock in opposite lock order.
+        #[cfg(feature = "git")]
+        self.flush_and_release_git_write_batch_object_store_lock()?;
 
         // Update working copy before reporting repo changes, so that
         // potential errors while reporting changes (broken pipe, etc)

@@ -647,24 +647,25 @@ impl GitWriteBatch {
 
 struct GitHashWriter<W> {
     inner: W,
-    hasher: Option<gix::hash::Hasher>,
+    hasher: FastSha1,
 }
 
 impl<W: io::Write> GitHashWriter<W> {
-    fn new(inner: W, hash_kind: gix::hash::Kind) -> Self {
-        Self {
-            inner,
-            hasher: Some(gix::hash::hasher(hash_kind)),
+    fn new(inner: W, hash_kind: gix::hash::Kind) -> io::Result<Self> {
+        if hash_kind != gix::hash::Kind::Sha1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported Git pack hash kind: {hash_kind}"),
+            ));
         }
+        Ok(Self {
+            inner,
+            hasher: FastSha1::new(),
+        })
     }
 
     fn finish(mut self) -> io::Result<(W, gix::hash::ObjectId)> {
-        let digest = self
-            .hasher
-            .take()
-            .unwrap()
-            .try_finalize()
-            .map_err(io::Error::other)?;
+        let digest = self.hasher.finalize();
         self.inner.write_all(digest.as_bytes())?;
         self.inner.flush()?;
         Ok((self.inner, digest))
@@ -674,7 +675,7 @@ impl<W: io::Write> GitHashWriter<W> {
 impl<W: io::Write> io::Write for GitHashWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buf)?;
-        self.hasher.as_mut().unwrap().update(&buf[..written]);
+        self.hasher.update(&buf[..written]);
         Ok(written)
     }
 
@@ -725,7 +726,7 @@ fn write_git_pack(
         ));
     }
 
-    let mut writer = GitHashWriter::new(io::BufWriter::new(output), hash_kind);
+    let mut writer = GitHashWriter::new(io::BufWriter::new(output), hash_kind)?;
     writer.write_all(b"PACK")?;
     writer.write_all(&2_u32.to_be_bytes())?;
     writer.write_all(&object_count.to_be_bytes())?;
@@ -777,7 +778,7 @@ fn write_git_pack_index(
             .ok_or_else(|| io::Error::other("pack fanout overflow"))?;
     }
 
-    let mut writer = GitHashWriter::new(io::BufWriter::new(output), pack_hash.kind());
+    let mut writer = GitHashWriter::new(io::BufWriter::new(output), pack_hash.kind())?;
     writer.write_all(V2_SIGNATURE)?;
     writer.write_all(&2_u32.to_be_bytes())?;
     for value in fanout {
@@ -954,6 +955,20 @@ impl GitWriteBatchGuard {
             &self.objects_dir,
             &self.git_repo_path,
         )
+    }
+
+    /// Makes the current batch durable and releases the command-scoped
+    /// object-store lock. Subsequent writes will reacquire the lock as needed.
+    pub fn flush_and_release_object_store_lock(&mut self) -> BackendResult<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.flush()?;
+        let mut state = self.state.lock().unwrap();
+        if let Some(batch) = state.batch.as_mut() {
+            drop(batch.object_store_lock.take());
+        }
+        Ok(())
     }
 
     fn finish_inner(&mut self) -> BackendResult<()> {
@@ -1563,74 +1578,107 @@ impl GitBackend {
 /// This is only used for tree objects synthesized from parsed [`Tree`] values. Blobs and
 /// commits can contain arbitrary input and continue to use gix's collision-checking hasher.
 fn compute_synthesized_tree_hash(bytes: &[u8]) -> gix::hash::ObjectId {
-    #[cfg(target_vendor = "apple")]
-    {
-        compute_synthesized_tree_hash_common_crypto(bytes)
-    }
+    let mut hasher = FastSha1::new();
+    hasher.update(&gix::objs::encode::loose_header(
+        gix::objs::Kind::Tree,
+        bytes.len() as u64,
+    ));
+    hasher.update(bytes);
+    hasher.finalize()
+}
 
+/// SHA-1 without collision detection.
+///
+/// Synthesized trees have trusted structure, while pack and index hashes are transport
+/// checksums rather than object identities. Object identities from arbitrary input still use
+/// gix's collision-checking SHA-1 implementation.
+struct FastSha1 {
+    #[cfg(target_vendor = "apple")]
+    context: CommonCryptoSha1Context,
     #[cfg(not(target_vendor = "apple"))]
-    {
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(gix::objs::encode::loose_header(
-            gix::objs::Kind::Tree,
-            bytes.len() as u64,
-        ));
-        hasher.update(bytes);
-        gix::hash::ObjectId::from_bytes_or_panic(&hasher.finalize())
-    }
+    inner: sha1::Sha1,
+}
+
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+#[derive(Default)]
+struct CommonCryptoSha1Context {
+    state: [u32; 5],
+    bit_count: [u32; 2],
+    data: [u32; 16],
+    buffered_len: std::ffi::c_int,
 }
 
 #[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
-fn compute_synthesized_tree_hash_common_crypto(bytes: &[u8]) -> gix::hash::ObjectId {
-    #[repr(C)]
-    #[derive(Default)]
-    struct Sha1Context {
-        state: [u32; 5],
-        bit_count: [u32; 2],
-        data: [u32; 16],
-        buffered_len: std::ffi::c_int,
-    }
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    #[link_name = "CC_SHA1_Init"]
+    fn cc_sha1_init(context: *mut CommonCryptoSha1Context) -> std::ffi::c_int;
+    #[link_name = "CC_SHA1_Update"]
+    fn cc_sha1_update(
+        context: *mut CommonCryptoSha1Context,
+        data: *const std::ffi::c_void,
+        len: u32,
+    ) -> std::ffi::c_int;
+    #[link_name = "CC_SHA1_Final"]
+    fn cc_sha1_final(digest: *mut u8, context: *mut CommonCryptoSha1Context) -> std::ffi::c_int;
+}
 
-    #[link(name = "System", kind = "dylib")]
-    unsafe extern "C" {
-        #[link_name = "CC_SHA1_Init"]
-        fn cc_sha1_init(context: *mut Sha1Context) -> std::ffi::c_int;
-        #[link_name = "CC_SHA1_Update"]
-        fn cc_sha1_update(
-            context: *mut Sha1Context,
-            data: *const std::ffi::c_void,
-            len: u32,
-        ) -> std::ffi::c_int;
-        #[link_name = "CC_SHA1_Final"]
-        fn cc_sha1_final(digest: *mut u8, context: *mut Sha1Context) -> std::ffi::c_int;
-    }
+#[allow(unsafe_code)]
+impl FastSha1 {
+    fn new() -> Self {
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut context = CommonCryptoSha1Context::default();
+            // SAFETY: `context` points to writable storage with CommonCrypto's layout.
+            assert_eq!(unsafe { cc_sha1_init(&raw mut context) }, 1);
+            Self { context }
+        }
 
-    fn update(context: &mut Sha1Context, bytes: &[u8]) {
-        for chunk in bytes.chunks(u32::MAX as usize) {
-            // SAFETY: `context` and `chunk` remain valid for the duration of the call.
-            let success =
-                unsafe { cc_sha1_update(context, chunk.as_ptr().cast(), chunk.len() as u32) };
-            assert_eq!(success, 1);
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Self {
+                inner: sha1::Sha1::new(),
+            }
         }
     }
 
-    let mut context = Sha1Context::default();
-    // SAFETY: `context` points to writable storage with the layout declared by CommonCrypto.
-    assert_eq!(unsafe { cc_sha1_init(&raw mut context) }, 1);
-    update(
-        &mut context,
-        &gix::objs::encode::loose_header(gix::objs::Kind::Tree, bytes.len() as u64),
-    );
-    update(&mut context, bytes);
+    fn update(&mut self, bytes: &[u8]) {
+        #[cfg(target_vendor = "apple")]
+        for chunk in bytes.chunks(u32::MAX as usize) {
+            // SAFETY: `context` and `chunk` remain valid for the duration of the call.
+            let success = unsafe {
+                cc_sha1_update(
+                    &raw mut self.context,
+                    chunk.as_ptr().cast(),
+                    chunk.len() as u32,
+                )
+            };
+            assert_eq!(success, 1);
+        }
 
-    let mut digest = [0; 20];
-    // SAFETY: `digest` has SHA-1's required 20 bytes and `context` is initialized.
-    assert_eq!(
-        unsafe { cc_sha1_final(digest.as_mut_ptr(), &raw mut context) },
-        1
-    );
-    gix::hash::ObjectId::from_bytes_or_panic(&digest)
+        #[cfg(not(target_vendor = "apple"))]
+        self.inner.update(bytes);
+    }
+
+    fn finalize(mut self) -> gix::hash::ObjectId {
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut digest = [0; HASH_LENGTH];
+            // SAFETY: `digest` has SHA-1's required size and `context` is initialized.
+            assert_eq!(
+                unsafe { cc_sha1_final(digest.as_mut_ptr(), &raw mut self.context) },
+                1
+            );
+            gix::hash::ObjectId::from_bytes_or_panic(&digest)
+        }
+
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            gix::hash::ObjectId::from_bytes_or_panic(&self.inner.finalize())
+        }
+    }
 }
 
 fn compress_git_object_data(bytes: &[u8]) -> io::Result<Vec<u8>> {
@@ -3571,6 +3619,13 @@ mod tests {
         assert!(FileLock::try_lock(lock_path.clone())?.is_some());
         backend
             .write_file_bytes(RepoPath::root(), b"take the lazy lock")
+            .block_on()?;
+        first_batch.flush()?;
+        assert!(FileLock::try_lock(lock_path.clone())?.is_none());
+        first_batch.flush_and_release_object_store_lock()?;
+        assert!(FileLock::try_lock(lock_path.clone())?.is_some());
+        backend
+            .write_file_bytes(RepoPath::root(), b"reacquire after release")
             .block_on()?;
         first_batch.flush()?;
         assert!(FileLock::try_lock(lock_path.clone())?.is_none());
