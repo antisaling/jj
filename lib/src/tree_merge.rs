@@ -17,17 +17,20 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::iter::zip;
 use std::sync::Arc;
 use std::vec;
 
-use ahash::AHashMap;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use pollster::FutureExt as _;
+use rayon::iter::IntoParallelIterator as _;
+use rayon::prelude::ParallelIterator as _;
 
 use crate::backend;
+use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::MergedTreeVal;
 use crate::backend::MergedTreeValue;
@@ -93,13 +96,48 @@ pub async fn merge_trees(store: &Arc<Store>, merge: Merge<TreeId>) -> BackendRes
 
 struct MergedTreeInput {
     input_trees: Merge<Tree>,
-    /// Whether each merge term is identical to the corresponding input tree.
-    same_as_input: Vec<bool>,
+    /// Input tree terms which may still be identical to the output tree.
+    reusable_input_terms: Vec<usize>,
+    /// Value by which this tree was referenced from its parent.
+    parent_input: Option<MergedTreeValue>,
     resolved: BTreeMap<RepoPathComponentBuf, TreeValue>,
     /// Entries that we're currently waiting for data for in order to resolve
-    /// them. When this map becomes empty, we're ready to write the tree(s).
-    pending_inputs: AHashMap<RepoPathComponentBuf, MergedTreeValue>,
+    /// them. When this reaches zero, we're ready to write the tree(s).
+    pending_entries: usize,
     conflicts: BTreeMap<RepoPathComponentBuf, MergedTreeValue>,
+}
+
+enum ClassifiedTreeEntry<'a> {
+    Resolved {
+        basename: RepoPathComponentBuf,
+        input_value: MergedTreeVal<'a>,
+        resolved_value: Option<&'a TreeValue>,
+        owned_value: Option<TreeValue>,
+    },
+    NonTrivial {
+        basename: RepoPathComponentBuf,
+        value: MergedTreeValue,
+    },
+}
+
+fn classify_tree_entry<'a>(
+    basename: RepoPathComponentBuf,
+    input_value: MergedTreeVal<'a>,
+    same_change: SameChange,
+) -> ClassifiedTreeEntry<'a> {
+    if let Some(resolved_value) = input_value.resolve_trivial(same_change) {
+        ClassifiedTreeEntry::Resolved {
+            basename,
+            resolved_value: *resolved_value,
+            owned_value: resolved_value.cloned(),
+            input_value,
+        }
+    } else {
+        ClassifiedTreeEntry::NonTrivial {
+            basename,
+            value: input_value.cloned(),
+        }
+    }
 }
 
 fn build_conflicted_backend_trees(
@@ -236,14 +274,17 @@ mod tests {
 impl MergedTreeInput {
     fn new(
         input_trees: Merge<Tree>,
-        same_as_input: Vec<bool>,
+        reusable_input_terms: Vec<usize>,
+        parent_input: Option<MergedTreeValue>,
         resolved: BTreeMap<RepoPathComponentBuf, TreeValue>,
+        pending_entries: usize,
     ) -> Self {
         Self {
             input_trees,
-            same_as_input,
+            reusable_input_terms,
+            parent_input,
             resolved,
-            pending_inputs: AHashMap::new(),
+            pending_entries,
             conflicts: BTreeMap::new(),
         }
     }
@@ -251,49 +292,57 @@ impl MergedTreeInput {
     fn mark_completed(
         &mut self,
         basename: RepoPathComponentBuf,
-        value: MergedTreeValue,
+        input_value: MergedTreeValue,
+        output_value: Option<MergedTreeValue>,
         same_change: SameChange,
     ) {
-        let input_value = self
-            .pending_inputs
-            .remove(&basename)
+        self.pending_entries = self
+            .pending_entries
+            .checked_sub(1)
             .expect("No pending input for {basename:?}");
+        let Some(value) = output_value else {
+            // Failed file merges return the unchanged input. Move that input directly
+            // into the result instead of cloning it just to compare it with itself.
+            self.conflicts.insert(basename, input_value);
+            return;
+        };
         if input_value.num_sides() != value.num_sides() {
             // A nested merge may simplify its sides. The remaining terms no longer have
             // positional correspondence with the input trees, so don't attempt reuse.
-            self.same_as_input.fill(false);
+            self.reusable_input_terms.clear();
         }
         if let Some(resolved) = value.resolve_trivial(same_change) {
-            for (same_as_input, input_value) in
-                self.same_as_input.iter_mut().zip(input_value.iter())
-            {
-                *same_as_input &= input_value == resolved;
+            if input_value.num_sides() == value.num_sides() {
+                self.reusable_input_terms
+                    .retain(|&index| input_value.as_slice()[index] == *resolved);
             }
             if let Some(resolved) = resolved.as_ref() {
                 self.resolved.insert(basename, resolved.clone());
             }
         } else {
-            for (same_as_input, (input_value, output_value)) in self
-                .same_as_input
-                .iter_mut()
-                .zip(input_value.iter().zip(value.iter()))
-            {
-                *same_as_input &= input_value == output_value;
+            if input_value.num_sides() == value.num_sides() {
+                self.reusable_input_terms
+                    .retain(|&index| input_value.as_slice()[index] == value.as_slice()[index]);
             }
             self.conflicts.insert(basename, value);
         }
     }
 
-    fn into_backend_trees(self) -> (Merge<backend::Tree>, Merge<Option<Tree>>) {
-        assert!(self.pending_inputs.is_empty());
+    fn into_backend_trees(
+        self,
+    ) -> (
+        Merge<backend::Tree>,
+        Merge<Option<Tree>>,
+        Option<MergedTreeValue>,
+    ) {
+        assert_eq!(self.pending_entries, 0);
         let input_trees = self.input_trees;
 
         if self.conflicts.is_empty() {
             let reusable_tree = self
-                .same_as_input
-                .into_iter()
-                .zip(input_trees)
-                .find_map(|(same_as_input, tree)| same_as_input.then_some(tree));
+                .reusable_input_terms
+                .first()
+                .and_then(|&index| input_trees.into_iter().nth(index));
             let backend_tree = if reusable_tree.is_some() {
                 backend::Tree::default()
             } else {
@@ -302,12 +351,18 @@ impl MergedTreeInput {
             (
                 Merge::resolved(backend_tree),
                 Merge::resolved(reusable_tree),
+                self.parent_input,
             )
         } else {
             let output_num_terms = self.conflicts.first_key_value().unwrap().1.iter().count();
-            let reusable_trees: Vec<_> = if output_num_terms == self.same_as_input.len() {
-                zip(self.same_as_input, input_trees)
-                    .map(|(same_as_input, tree)| same_as_input.then_some(tree))
+            let reusable_trees: Vec<_> = if output_num_terms == input_trees.iter().count() {
+                let mut reusable_input_terms = self.reusable_input_terms.into_iter().peekable();
+                input_trees
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, tree)| {
+                        (reusable_input_terms.next_if_eq(&index).is_some()).then_some(tree)
+                    })
                     .collect()
             } else {
                 // A nested merge simplified the terms, so output terms no longer have
@@ -320,6 +375,7 @@ impl MergedTreeInput {
             (
                 Merge::from_vec(backend_trees),
                 Merge::from_vec(reusable_trees),
+                self.parent_input,
             )
         }
     }
@@ -330,15 +386,16 @@ enum TreeMergerWorkOutput {
     /// Trees that have been read (i.e. `Read` is past tense)
     ReadTrees {
         dir: RepoPathBuf,
-        result: BackendResult<Merge<Tree>>,
+        result: BackendResult<(MergedTreeValue, Merge<Tree>)>,
     },
     WrittenTrees {
         dir: RepoPathBuf,
+        parent_input: Option<MergedTreeValue>,
         result: BackendResult<Merge<Tree>>,
     },
     MergedFiles {
         path: RepoPathBuf,
-        result: BackendResult<MergedTreeValue>,
+        result: BackendResult<(MergedTreeValue, Option<MergedTreeValue>)>,
     },
 }
 
@@ -365,12 +422,18 @@ impl TreeMerger {
         while let Some(work_item) = self.work.next().await {
             match work_item {
                 TreeMergerWorkOutput::ReadTrees { dir, result } => {
-                    let tree = result?;
-                    self.process_tree(dir, tree);
+                    let (input_value, tree) = result?;
+                    let parent_input = (!dir.is_root()).then_some(input_value);
+                    self.process_tree(dir, tree, parent_input);
                 }
-                TreeMergerWorkOutput::WrittenTrees { dir, result } => {
+                TreeMergerWorkOutput::WrittenTrees {
+                    dir,
+                    parent_input,
+                    result,
+                } => {
                     let tree = result?;
                     if dir.is_root() {
+                        assert!(parent_input.is_none());
                         assert!(self.trees_to_resolve.is_empty());
                         assert!(self.work.is_empty());
                         assert!(self.unstarted_work.is_empty());
@@ -381,11 +444,11 @@ impl TreeMerger {
                         (tree.id() != self.store.empty_tree_id())
                             .then(|| TreeValue::Tree(tree.id().clone()))
                     });
-                    self.mark_completed(&dir, new_value);
+                    self.mark_completed(&dir, parent_input.unwrap(), Some(new_value));
                 }
                 TreeMergerWorkOutput::MergedFiles { path, result } => {
-                    let value = result?;
-                    self.mark_completed(&path, value);
+                    let (input_value, output_value) = result?;
+                    self.mark_completed(&path, input_value, output_value);
                 }
             }
 
@@ -401,40 +464,83 @@ impl TreeMerger {
         unreachable!("There was no work item for writing the root tree");
     }
 
-    fn process_tree(&mut self, dir: RepoPathBuf, tree: Merge<Tree>) {
+    fn process_tree(
+        &mut self,
+        dir: RepoPathBuf,
+        tree: Merge<Tree>,
+        parent_input: Option<MergedTreeValue>,
+    ) {
         // First resolve trivial merges (those that we don't need to load any more data
         // for)
         let same_change = self.store.merge_options().same_change;
         let mut resolved = vec![];
         let mut non_trivial = vec![];
-        let mut same_as_input = vec![true; tree.iter().count()];
-        for (basename, path_merge) in all_merged_tree_entries(&tree) {
-            if let Some(value) = path_merge.resolve_trivial(same_change) {
-                for (same_as_input, input_value) in same_as_input.iter_mut().zip(path_merge.iter())
-                {
-                    *same_as_input &= input_value == value;
+        let mut reusable_input_terms: Vec<_> = (0..tree.iter().count()).collect();
+        // Keep only a small number of term-heavy entry merges alive at once. Large
+        // rebases can have thousands of terms, so collecting the whole tree before
+        // parallelizing would explode memory.
+        let chunk_size = self.store.concurrency().saturating_mul(2).clamp(1, 64);
+        let mut entries = all_merged_tree_entries(&tree);
+        loop {
+            let chunk: Vec<_> = entries
+                .by_ref()
+                .take(chunk_size)
+                .map(|(basename, input_value)| (basename.to_owned(), input_value))
+                .collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let classified: Vec<_> = chunk
+                .into_par_iter()
+                .map(|(basename, input_value)| {
+                    classify_tree_entry(basename, input_value, same_change)
+                })
+                .collect();
+            for entry in classified {
+                match entry {
+                    ClassifiedTreeEntry::Resolved {
+                        basename,
+                        input_value,
+                        resolved_value,
+                        owned_value,
+                    } => {
+                        reusable_input_terms
+                            .retain(|&index| input_value.as_slice()[index] == resolved_value);
+                        if let Some(value) = owned_value {
+                            resolved.push((basename, value));
+                        }
+                    }
+                    ClassifiedTreeEntry::NonTrivial { basename, value } => {
+                        non_trivial.push((basename, value));
+                    }
                 }
-                if let Some(value) = value.cloned() {
-                    resolved.push((basename.to_owned(), value));
-                }
-            } else {
-                non_trivial.push((basename.to_owned(), path_merge.cloned()));
             }
         }
+        drop(entries);
 
         // If there are no non-trivial merges, we can write the tree now.
         if non_trivial.is_empty() {
-            let tree = MergedTreeInput::new(tree, same_as_input, resolved.into_iter().collect());
-            let (backend_trees, reusable_trees) = tree.into_backend_trees();
-            self.enqueue_tree_write(dir, reusable_trees, backend_trees);
+            let tree = MergedTreeInput::new(
+                tree,
+                reusable_input_terms,
+                parent_input,
+                resolved.into_iter().collect(),
+                0,
+            );
+            let (backend_trees, reusable_trees, parent_input) = tree.into_backend_trees();
+            self.enqueue_tree_write(dir, parent_input, reusable_trees, backend_trees);
             return;
         }
 
-        let mut unmerged_tree =
-            MergedTreeInput::new(tree, same_as_input, resolved.into_iter().collect());
+        let unmerged_tree = MergedTreeInput::new(
+            tree,
+            reusable_input_terms,
+            parent_input,
+            resolved.into_iter().collect(),
+            non_trivial.len(),
+        );
         for (basename, value) in non_trivial {
             let path = dir.join(&basename);
-            unmerged_tree.pending_inputs.insert(basename, value.clone());
             if value.is_tree() {
                 self.enqueue_tree_read(path, value);
             } else {
@@ -462,6 +568,7 @@ impl TreeMerger {
     fn enqueue_tree_write(
         &mut self,
         dir: RepoPathBuf,
+        parent_input: Option<MergedTreeValue>,
         reusable_trees: Merge<Option<Tree>>,
         backend_trees: Merge<backend::Tree>,
     ) {
@@ -471,7 +578,11 @@ impl TreeMerger {
             reusable_trees,
             backend_trees,
         )
-        .map(|result| TreeMergerWorkOutput::WrittenTrees { dir, result });
+        .map(|result| TreeMergerWorkOutput::WrittenTrees {
+            dir,
+            parent_input,
+            result,
+        });
         // Bypass the `unstarted_work` queue because writing trees usually results in
         // saving memory (each tree gets replaced by a `TreeValue::Tree`)
         self.work.push(Box::pin(work_fut));
@@ -479,7 +590,7 @@ impl TreeMerger {
 
     fn enqueue_file_merge(&mut self, path: RepoPathBuf, value: MergedTreeValue) {
         let key = TreeMergeWorkItemKey::MergeFiles { path: path.clone() };
-        let work_fut = resolve_file_values_owned(self.store.clone(), path.clone(), value)
+        let work_fut = resolve_file_values_owned_on_worker(self.store.clone(), path.clone(), value)
             .map(|result| TreeMergerWorkOutput::MergedFiles { path, result });
         if self.work.len() < self.store.concurrency() {
             self.work.push(Box::pin(work_fut));
@@ -488,17 +599,22 @@ impl TreeMerger {
         }
     }
 
-    fn mark_completed(&mut self, path: &RepoPath, value: MergedTreeValue) {
+    fn mark_completed(
+        &mut self,
+        path: &RepoPath,
+        input_value: MergedTreeValue,
+        output_value: Option<MergedTreeValue>,
+    ) {
         let (dir, basename) = path.split().unwrap();
         let tree = self.trees_to_resolve.get_mut(dir).unwrap();
         let same_change = self.store.merge_options().same_change;
-        tree.mark_completed(basename.to_owned(), value, same_change);
+        tree.mark_completed(basename.to_owned(), input_value, output_value, same_change);
         // If all entries in this tree have been processed (either resolved or still a
         // conflict), schedule the writing of the tree(s) to the backend.
-        if tree.pending_inputs.is_empty() {
+        if tree.pending_entries == 0 {
             let tree = self.trees_to_resolve.remove(dir).unwrap();
-            let (backend_trees, reusable_trees) = tree.into_backend_trees();
-            self.enqueue_tree_write(dir.to_owned(), reusable_trees, backend_trees);
+            let (backend_trees, reusable_trees, parent_input) = tree.into_backend_trees();
+            self.enqueue_tree_write(dir.to_owned(), parent_input, reusable_trees, backend_trees);
         }
     }
 }
@@ -507,12 +623,12 @@ async fn read_trees(
     store: Arc<Store>,
     dir: RepoPathBuf,
     value: MergedTreeValue,
-) -> BackendResult<Merge<Tree>> {
+) -> BackendResult<(MergedTreeValue, Merge<Tree>)> {
     let trees = value
         .to_tree_merge(&store, &dir)
         .await?
         .expect("Should be tree merge");
-    Ok(trees)
+    Ok((value, trees))
 }
 
 async fn write_trees(
@@ -552,9 +668,24 @@ async fn resolve_file_values_owned(
     store: Arc<Store>,
     path: RepoPathBuf,
     values: MergedTreeValue,
-) -> BackendResult<MergedTreeValue> {
+) -> BackendResult<(MergedTreeValue, Option<MergedTreeValue>)> {
     let maybe_resolved = try_resolve_file_values(&store, &path, &values).await?;
-    Ok(maybe_resolved.unwrap_or(values))
+    Ok((values, maybe_resolved))
+}
+
+async fn resolve_file_values_owned_on_worker(
+    store: Arc<Store>,
+    path: RepoPathBuf,
+    values: MergedTreeValue,
+) -> BackendResult<(MergedTreeValue, Option<MergedTreeValue>)> {
+    let (sender, receiver) = oneshot::channel();
+    rayon::spawn(move || {
+        let result = resolve_file_values_owned(store, path, values).block_on();
+        drop(sender.send(result));
+    });
+    receiver.await.map_err(|_| {
+        BackendError::Other(Box::new(std::io::Error::other("file merge task exited")))
+    })?
 }
 
 /// Tries to resolve file conflicts by merging the file contents. Treats missing
