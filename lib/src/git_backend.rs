@@ -81,6 +81,7 @@ use crate::backend::SigningFn;
 use crate::backend::SymlinkId;
 use crate::backend::Timestamp;
 use crate::backend::Tree;
+use crate::backend::TreeEntry;
 use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::backend::make_root_commit;
@@ -418,78 +419,101 @@ fn git_tree_entry_cmp(a: &GitTreeEntry<'_>, b: &GitTreeEntry<'_>) -> Ordering {
     })
 }
 
-fn serialize_git_tree(mut entries: Vec<GitTreeEntry<'_>>) -> io::Result<Vec<u8>> {
-    if !entries.is_sorted_by(|a, b| git_tree_entry_cmp(a, b) != Ordering::Greater) {
-        entries.sort_unstable_by(git_tree_entry_cmp);
+fn to_git_tree_entry(entry: TreeEntry<'_>) -> GitTreeEntry<'_> {
+    match entry.value() {
+        TreeValue::File {
+            id,
+            executable: false,
+            copy_id: _, // TODO: Use the value
+        } => GitTreeEntry {
+            name: entry.name().as_internal_str().as_bytes(),
+            mode: b"100644",
+            oid: id.as_bytes(),
+            is_tree: false,
+        },
+        TreeValue::File {
+            id,
+            executable: true,
+            copy_id: _, // TODO: Use the value
+        } => GitTreeEntry {
+            name: entry.name().as_internal_str().as_bytes(),
+            mode: b"100755",
+            oid: id.as_bytes(),
+            is_tree: false,
+        },
+        TreeValue::Symlink(id) => GitTreeEntry {
+            name: entry.name().as_internal_str().as_bytes(),
+            mode: b"120000",
+            oid: id.as_bytes(),
+            is_tree: false,
+        },
+        TreeValue::Tree(id) => GitTreeEntry {
+            name: entry.name().as_internal_str().as_bytes(),
+            mode: b"40000",
+            oid: id.as_bytes(),
+            is_tree: true,
+        },
+        TreeValue::GitSubmodule(id) => GitTreeEntry {
+            name: entry.name().as_internal_str().as_bytes(),
+            mode: b"160000",
+            oid: id.as_bytes(),
+            is_tree: false,
+        },
     }
-    let size = entries
-        .iter()
+}
+
+fn write_git_tree_entry(bytes: &mut Vec<u8>, entry: GitTreeEntry<'_>) -> io::Result<()> {
+    if entry.name.contains(&0) {
+        return Err(gix::objs::tree::write::Error::NullbyteInFilename {
+            name: BString::from(entry.name),
+        }
+        .into());
+    }
+    bytes.extend_from_slice(entry.mode);
+    bytes.push(b' ');
+    bytes.extend_from_slice(entry.name);
+    bytes.push(0);
+    bytes.extend_from_slice(entry.oid);
+    Ok(())
+}
+
+fn serialize_git_tree(contents: &Tree) -> io::Result<Vec<u8>> {
+    let size = contents
+        .entries()
+        .map(to_git_tree_entry)
         .map(|entry| entry.mode.len() + 1 + entry.name.len() + 1 + entry.oid.len())
         .sum();
     let mut bytes = Vec::with_capacity(size);
-    for entry in entries {
-        if entry.name.contains(&0) {
-            return Err(gix::objs::tree::write::Error::NullbyteInFilename {
-                name: BString::from(entry.name),
-            }
-            .into());
+
+    // `Tree` entries are already byte-sorted by name. Git's ordering only
+    // differs by comparing directory names as if they had a trailing `/`.
+    // Delay such directories while later names compare before that virtual
+    // slash. Delayed directories are necessarily nested, so a stack restores
+    // exact Git order in linear time.
+    let mut pending_trees: Vec<GitTreeEntry<'_>> = Vec::new();
+    for entry in contents.entries().map(to_git_tree_entry) {
+        while pending_trees
+            .last()
+            .is_some_and(|tree| git_tree_entry_cmp(tree, &entry) != Ordering::Greater)
+        {
+            write_git_tree_entry(&mut bytes, pending_trees.pop().unwrap())?;
         }
-        bytes.extend_from_slice(entry.mode);
-        bytes.push(b' ');
-        bytes.extend_from_slice(entry.name);
-        bytes.push(0);
-        bytes.extend_from_slice(entry.oid);
+        if entry.is_tree {
+            pending_trees.push(entry);
+        } else {
+            write_git_tree_entry(&mut bytes, entry)?;
+        }
+    }
+    while let Some(entry) = pending_trees.pop() {
+        write_git_tree_entry(&mut bytes, entry)?;
     }
     Ok(bytes)
 }
 
 fn serialize_and_hash_git_tree(contents: &Tree) -> BackendResult<(Vec<u8>, gix::hash::ObjectId)> {
-    let entries = contents
-        .entries()
-        .map(|entry| match entry.value() {
-            TreeValue::File {
-                id,
-                executable: false,
-                copy_id: _, // TODO: Use the value
-            } => GitTreeEntry {
-                name: entry.name().as_internal_str().as_bytes(),
-                mode: b"100644",
-                oid: id.as_bytes(),
-                is_tree: false,
-            },
-            TreeValue::File {
-                id,
-                executable: true,
-                copy_id: _, // TODO: Use the value
-            } => GitTreeEntry {
-                name: entry.name().as_internal_str().as_bytes(),
-                mode: b"100755",
-                oid: id.as_bytes(),
-                is_tree: false,
-            },
-            TreeValue::Symlink(id) => GitTreeEntry {
-                name: entry.name().as_internal_str().as_bytes(),
-                mode: b"120000",
-                oid: id.as_bytes(),
-                is_tree: false,
-            },
-            TreeValue::Tree(id) => GitTreeEntry {
-                name: entry.name().as_internal_str().as_bytes(),
-                mode: b"40000",
-                oid: id.as_bytes(),
-                is_tree: true,
-            },
-            TreeValue::GitSubmodule(id) => GitTreeEntry {
-                name: entry.name().as_internal_str().as_bytes(),
-                mode: b"160000",
-                oid: id.as_bytes(),
-                is_tree: false,
-            },
-        })
-        .collect();
     // Serialize and hash outside the repository lock. gix's `write_object()` does both
     // while holding the lock and hashes the serialized object again before writing it.
-    let bytes = serialize_git_tree(entries).map_err(|err| BackendError::WriteObject {
+    let bytes = serialize_git_tree(contents).map_err(|err| BackendError::WriteObject {
         object_type: "tree",
         source: Box::new(err),
     })?;
@@ -3184,6 +3208,7 @@ mod tests {
 
     const GIT_USER: &str = "Someone";
     const GIT_EMAIL: &str = "someone@example.com";
+    const TEST_HASH_LENGTH: usize = 20;
 
     fn git_config() -> Vec<bstr::BString> {
         vec![
@@ -3199,29 +3224,101 @@ mod tests {
             .strict_config(true)
     }
 
+    fn test_tree_value(id_byte: u8, is_tree: bool) -> TreeValue {
+        if is_tree {
+            TreeValue::Tree(TreeId::from_bytes(&[id_byte; TEST_HASH_LENGTH]))
+        } else {
+            TreeValue::File {
+                id: FileId::from_bytes(&[id_byte; TEST_HASH_LENGTH]),
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            }
+        }
+    }
+
+    fn serialized_git_tree_names(mut bytes: &[u8]) -> Vec<&str> {
+        let mut names = Vec::new();
+        while !bytes.is_empty() {
+            let mode_end = bytes.iter().position(|byte| *byte == b' ').unwrap();
+            bytes = &bytes[mode_end + 1..];
+            let name_end = bytes.iter().position(|byte| *byte == 0).unwrap();
+            names.push(str::from_utf8(&bytes[..name_end]).unwrap());
+            bytes = &bytes[name_end + 1 + TEST_HASH_LENGTH..];
+        }
+        names
+    }
+
     #[test]
     fn serialize_git_tree_uses_git_sort_order() -> TestResult {
-        const SHA1_LENGTH: usize = 20;
-        let entries = vec![
-            GitTreeEntry {
-                name: b"foo",
-                mode: b"40000",
-                oid: &[1; SHA1_LENGTH],
-                is_tree: true,
-            },
-            GitTreeEntry {
-                name: b"foo.bar",
-                mode: b"100644",
-                oid: &[2; SHA1_LENGTH],
-                is_tree: false,
-            },
-        ];
-        let bytes = serialize_git_tree(entries)?;
+        let tree = Tree::from_sorted_entries(vec![
+            (RepoPathComponentBuf::new("foo")?, test_tree_value(1, true)),
+            (
+                RepoPathComponentBuf::new("foo.bar")?,
+                test_tree_value(2, false),
+            ),
+        ]);
+        let bytes = serialize_git_tree(&tree)?;
         let mut expected = b"100644 foo.bar\0".to_vec();
-        expected.extend_from_slice(&[2; SHA1_LENGTH]);
+        expected.extend_from_slice(&[2; TEST_HASH_LENGTH]);
         expected.extend_from_slice(b"40000 foo\0");
-        expected.extend_from_slice(&[1; SHA1_LENGTH]);
+        expected.extend_from_slice(&[1; TEST_HASH_LENGTH]);
         assert_eq!(bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_git_tree_handles_nested_git_sort_order() -> TestResult {
+        let alphabet = ['!', '.', '0', 'a'];
+        let mut names = Vec::new();
+        for first in alphabet {
+            names.push(first.to_string());
+            for second in alphabet {
+                names.push(format!("{first}{second}"));
+                for third in alphabet {
+                    names.push(format!("{first}{second}{third}"));
+                }
+            }
+        }
+        names.sort_unstable();
+        let tree = Tree::from_sorted_entries(
+            names
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let is_tree = name.len() < 3;
+                    Ok((
+                        RepoPathComponentBuf::new(name)?,
+                        test_tree_value(index as u8 + 1, is_tree),
+                    ))
+                })
+                .collect::<TestResult<_>>()?,
+        );
+        let mut expected = tree
+            .entries()
+            .map(|entry| {
+                let name = entry.name().as_internal_str();
+                let mut git_sort_key = name.as_bytes().to_vec();
+                if matches!(entry.value(), TreeValue::Tree(_)) {
+                    git_sort_key.push(b'/');
+                }
+                (git_sort_key, name)
+            })
+            .collect_vec();
+        expected.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let expected_names = expected.into_iter().map(|(_, name)| name).collect_vec();
+
+        let bytes = serialize_git_tree(&tree)?;
+        assert_eq!(serialized_git_tree_names(&bytes), expected_names);
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_git_tree_rejects_null_byte() -> TestResult {
+        let tree = Tree::from_sorted_entries(vec![(
+            RepoPathComponentBuf::new("bad\0name")?,
+            test_tree_value(1, false),
+        )]);
+        assert_matches!(serialize_git_tree(&tree), Err(_));
         Ok(())
     }
 
@@ -3247,7 +3344,7 @@ mod tests {
         let store_path = temp_dir.path().join("store");
         fs::create_dir(&store_path)?;
         let git_repo_path = temp_dir.path().join("git");
-        let git_repo = git_init(&git_repo_path);
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
         let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
 
         let write_batch = backend.start_write_batch();
@@ -3301,7 +3398,7 @@ mod tests {
         let store_path = temp_dir.path().join("store");
         fs::create_dir(&store_path)?;
         let git_repo_path = temp_dir.path().join("git");
-        let git_repo = git_init(&git_repo_path);
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
         let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
 
         let write_batch = backend.start_write_batch();
@@ -3740,13 +3837,13 @@ mod tests {
             u32::from_be_bytes(bytes[fanout_end - 4..fanout_end].try_into()?),
             2
         );
-        let ids_end = fanout_end + 2 * HASH_LENGTH;
+        let ids_end = fanout_end + 2 * TEST_HASH_LENGTH;
         assert_eq!(
-            &bytes[fanout_end..fanout_end + HASH_LENGTH],
+            &bytes[fanout_end..fanout_end + TEST_HASH_LENGTH],
             small_id.as_bytes()
         );
         assert_eq!(
-            &bytes[fanout_end + HASH_LENGTH..ids_end],
+            &bytes[fanout_end + TEST_HASH_LENGTH..ids_end],
             large_id.as_bytes()
         );
         let crc_end = ids_end + 2 * 4;
@@ -3762,10 +3859,10 @@ mod tests {
         );
         let pack_hash_start = offsets_end + 8;
         assert_eq!(
-            &bytes[pack_hash_start..pack_hash_start + HASH_LENGTH],
+            &bytes[pack_hash_start..pack_hash_start + TEST_HASH_LENGTH],
             pack_hash.as_bytes()
         );
-        let index_hash_start = pack_hash_start + HASH_LENGTH;
+        let index_hash_start = pack_hash_start + TEST_HASH_LENGTH;
         let mut hasher = gix::hash::hasher(pack_hash.kind());
         hasher.update(&bytes[..index_hash_start]);
         assert_eq!(
@@ -3820,13 +3917,13 @@ mod tests {
         let store_path = temp_dir.path().join("store");
         fs::create_dir(&store_path)?;
         let git_repo_path = temp_dir.path().join("git");
-        let git_repo = git_init(&git_repo_path);
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
         let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
         let contents = b"already loose";
         let file_id = backend
             .write_file_bytes(RepoPath::root(), contents)
             .block_on()?;
-        let file_oid = validate_git_object_id(&file_id)?;
+        let file_oid = validate_git_object_id(&git_repo, &file_id)?;
         assert!(loose_object_path(&backend.objects_dir, &file_oid).exists());
         drop(backend);
 
