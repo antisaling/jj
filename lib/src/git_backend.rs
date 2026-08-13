@@ -251,7 +251,15 @@ struct BufferedGitObject {
 }
 
 const MIN_BUFFERED_OBJECTS_PER_PACK: usize = 128;
+const MIN_BUFFERED_BYTES_PER_PACK: usize = 1024 * 1024;
+const MAX_BUFFERED_GIT_OBJECT_BYTES: usize = 512 * 1024 * 1024;
 const GIT_OBJECT_STORE_LOCK_FILE: &str = "jj-object-store.lock";
+
+impl BufferedGitObject {
+    fn allocated_bytes(&self) -> usize {
+        self.data.capacity() + self.compressed_data.capacity()
+    }
+}
 
 impl GitObjectWriteTracker {
     fn write_once(
@@ -563,6 +571,22 @@ impl GitWriteRepoPool {
         let mut repo = self.repos[index].lock().unwrap();
         f(&mut repo)
     }
+
+    fn refresh_after_pack(&self, id: gix::hash::ObjectId) -> BackendResult<()> {
+        self.with_repo(|repo| {
+            let refresh_mode = repo.objects.refresh_mode();
+            repo.objects.refresh = Default::default();
+            let result =
+                repo.find_object(id)
+                    .map(|_| ())
+                    .map_err(|err| BackendError::WriteObject {
+                        object_type: "pack",
+                        source: Box::new(err),
+                    });
+            repo.objects.refresh = refresh_mode;
+            result
+        })
+    }
 }
 
 #[derive(Default)]
@@ -571,6 +595,7 @@ struct GitWriteBatch {
     table_lock: Option<FileLock>,
     object_store_lock: Option<FileLock>,
     object_ids: Vec<gix::hash::ObjectId>,
+    buffered_object_bytes: usize,
     commit_ids: HashSet<CommitId>,
 }
 
@@ -624,6 +649,10 @@ pub struct GitWriteBatchGuard {
 }
 
 impl GitWriteBatch {
+    fn should_checkpoint(&self) -> bool {
+        self.buffered_object_bytes >= MAX_BUFFERED_GIT_OBJECT_BYTES
+    }
+
     fn ensure_object_store_lock(&mut self, git_repo_path: &Path) -> BackendResult<()> {
         if self.object_store_lock.is_none() {
             self.object_store_lock = Some(
@@ -672,6 +701,7 @@ impl GitWriteBatch {
             drop(table_lock);
         }
         self.object_ids.clear();
+        self.buffered_object_bytes = 0;
         self.commit_ids.clear();
         Ok(())
     }
@@ -918,10 +948,14 @@ fn flush_buffered_git_objects(
             .filter_map(|id| buffered_objects.get(id).map(|object| (*id, object.clone())))
             .collect_vec()
     };
-    if objects.len() < MIN_BUFFERED_OBJECTS_PER_PACK {
-        return write_buffered_git_objects_loose(&objects, write_repos);
-    }
-    if let Err(pack_err) = write_buffered_git_pack(&objects, objects_dir) {
+    let buffered_bytes = objects
+        .iter()
+        .map(|(_, object)| object.allocated_bytes())
+        .sum::<usize>();
+    if objects.len() < MIN_BUFFERED_OBJECTS_PER_PACK && buffered_bytes < MIN_BUFFERED_BYTES_PER_PACK
+    {
+        write_buffered_git_objects_loose(&objects, write_repos)?;
+    } else if let Err(pack_err) = write_buffered_git_pack(&objects, objects_dir) {
         // Preserve correctness if the batch writer fails. This is slower, but it
         // leaves every object reachable by the already-committed operation in the ODB.
         tracing::warn!(
@@ -929,6 +963,15 @@ fn flush_buffered_git_objects(
             "failed to write Git object pack; falling back to loose objects"
         );
         write_buffered_git_objects_loose(&objects, write_repos)?;
+    } else {
+        // All repository handles share the same dynamic ODB store. Refreshing one
+        // handle publishes the new pack generation to handles configured not to scan
+        // after expected misses.
+        write_repos.refresh_after_pack(objects[0].0)?;
+    }
+    let mut buffered_objects = buffered_objects.lock().unwrap();
+    for (id, _) in &objects {
+        buffered_objects.remove(id);
     }
     Ok(())
 }
@@ -1138,6 +1181,20 @@ impl GitBackend {
             &self.objects_dir,
             self.git_repo_path(),
         )
+    }
+
+    fn checkpoint_write_batch_if_full(&self) -> BackendResult<()> {
+        let should_checkpoint = self
+            .write_batch_state
+            .lock()
+            .unwrap()
+            .batch
+            .as_ref()
+            .is_some_and(GitWriteBatch::should_checkpoint);
+        if should_checkpoint {
+            self.flush_active_write_batch()?;
+        }
+        Ok(())
     }
 
     pub fn init_internal(
@@ -1571,6 +1628,7 @@ impl GitBackend {
             oid,
             object_type,
         )?;
+        self.checkpoint_write_batch_if_full()?;
         Ok(oid)
     }
 }
@@ -1675,6 +1733,9 @@ fn buffer_git_object(
         data: bytes,
         compressed_data,
     });
+    batch.buffered_object_bytes = batch
+        .buffered_object_bytes
+        .saturating_add(object.allocated_bytes());
     objects.insert(oid, object);
     batch.object_ids.push(oid);
     Ok(())
@@ -1692,6 +1753,9 @@ fn try_buffer_git_objects(
     let mut buffered_objects = buffered_objects.lock().unwrap();
     for (oid, object) in objects {
         if let std::collections::hash_map::Entry::Vacant(entry) = buffered_objects.entry(oid) {
+            batch.buffered_object_bytes = batch
+                .buffered_object_bytes
+                .saturating_add(object.allocated_bytes());
             entry.insert(Arc::new(object));
             batch.object_ids.push(oid);
         }
@@ -2582,6 +2646,7 @@ impl Backend for GitBackend {
             })?
         };
         write_result?;
+        self.checkpoint_write_batch_if_full()?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
     }
 
@@ -2664,6 +2729,7 @@ impl Backend for GitBackend {
                 // Buffered objects are readable before this notification, so
                 // waking a waiter racing with this batch is safe.
                 self.written_objects.mark_written_many(unique_oids);
+                self.checkpoint_write_batch_if_full()?;
                 return Ok(tree_ids);
             }
             Err(objects) => objects,
@@ -2957,6 +3023,8 @@ impl Backend for GitBackend {
                 .commit_ids
                 .insert(id.clone());
         }
+        drop(write_batch_state);
+        self.checkpoint_write_batch_if_full()?;
         Ok((id, contents))
     }
 
@@ -3755,6 +3823,21 @@ mod tests {
         assert_eq!(pack_files.len(), 1);
         assert_eq!(index_files.len(), 1);
         assert_eq!(pack_files[0].file_stem(), index_files[0].file_stem());
+        assert!(backend.buffered_objects.lock().unwrap().is_empty());
+        assert_eq!(
+            backend
+                .read_file_bytes(RepoPath::root(), &file_id)
+                .block_on()?,
+            b"packed content"
+        );
+        assert_eq!(
+            backend.read_tree(RepoPath::root(), &tree_id).block_on()?,
+            tree
+        );
+        assert_eq!(
+            backend.read_commit(&second_commit_id).block_on()?.root_tree,
+            Merge::resolved(second_tree_id.clone())
+        );
         let verify_output = Command::new(&backend.git_executable)
             .arg("verify-pack")
             .arg(&index_files[0])
@@ -3804,6 +3887,57 @@ mod tests {
             Merge::resolved(second_tree_id)
         );
         write_batch.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn write_batch_checkpoints_at_memory_limit() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path);
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+        let write_batch = backend.start_write_batch();
+        let lock_path = backend.git_object_store_lock_path();
+        backend
+            .write_batch_state
+            .lock()
+            .unwrap()
+            .batch
+            .as_mut()
+            .unwrap()
+            .buffered_object_bytes = MAX_BUFFERED_GIT_OBJECT_BYTES;
+
+        let contents = vec![0x5a; MIN_BUFFERED_BYTES_PER_PACK];
+        let file_id = backend
+            .write_file_bytes(RepoPath::root(), &contents)
+            .block_on()?;
+
+        let state = backend.write_batch_state.lock().unwrap();
+        let batch = state.batch.as_ref().unwrap();
+        assert!(batch.object_ids.is_empty());
+        assert_eq!(batch.buffered_object_bytes, 0);
+        drop(state);
+        assert!(backend.buffered_objects.lock().unwrap().is_empty());
+        assert!(FileLock::try_lock(lock_path.clone())?.is_none());
+        assert_eq!(
+            backend
+                .read_file_bytes(RepoPath::root(), &file_id)
+                .block_on()?,
+            contents
+        );
+        assert_eq!(
+            fs::read_dir(backend.objects_dir.join("pack"))?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension() == Some(OsStr::new("pack")))
+                .count(),
+            1
+        );
+
+        write_batch.finish()?;
+        assert!(FileLock::try_lock(lock_path)?.is_some());
         Ok(())
     }
 
