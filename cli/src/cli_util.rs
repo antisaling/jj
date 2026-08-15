@@ -511,9 +511,12 @@ impl CommandHelper {
                 // auto-update-stale, so let's do that now. We need to do it up here, not at a
                 // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
                 // of the working copy.
-                let WorkspaceCommandHelper { workspace, env, .. } = workspace_command;
-                self.recover_stale_working_copy_impl(ui, workspace, env, &git_import_export_lock)
-                    .await?
+                //
+                // Drop the failed helper before recovery loads another one. Git backends keep
+                // the object-store lock in the helper's write batch, and the recovery helper
+                // may be backed by a distinct GitBackend instance for the same repository.
+                drop(workspace_command);
+                self.recover_stale_working_copy(ui).await?
             }
         };
 
@@ -662,8 +665,14 @@ impl CommandHelper {
                 let wc_commit_id = workspace_command.get_wc_commit_id().unwrap();
                 let repo = workspace_command.repo();
                 let stale_wc_commit = repo.store().get_commit_async(wc_commit_id).await?;
-
-                let WorkspaceCommandHelper { workspace, env, .. } = workspace_command;
+                let (workspace, env) = {
+                    // The next helper loads the current operation and may create a different
+                    // GitBackend for the same repository. Let this helper and its write batch
+                    // drop before loading the replacement, or the object-store lock can block
+                    // the next helper on its own flock.
+                    let WorkspaceCommandHelper { workspace, env, .. } = workspace_command;
+                    (workspace, env)
+                };
                 let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
                 let repo = &workspace_command.user_repo.repo;
                 let desired_wc_commit = workspace_command.prepare_working_copy_mutation().await?;

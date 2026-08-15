@@ -219,6 +219,16 @@ impl Store {
         Ok(Tree::new(self.clone(), dir, id.clone(), data))
     }
 
+    /// Reads a transient tree without retaining it in the tree cache.
+    pub async fn get_tree_uncached(
+        self: &Arc<Self>,
+        dir: RepoPathBuf,
+        id: &TreeId,
+    ) -> BackendResult<Tree> {
+        let data = Arc::new(self.backend.read_tree(&dir, id).await?);
+        Ok(Tree::new(self.clone(), dir, id.clone(), data))
+    }
+
     async fn get_backend_tree(
         &self,
         dir: &RepoPath,
@@ -266,6 +276,24 @@ impl Store {
             .map(|(tree_id, tree)| {
                 let data = Arc::new(tree);
                 drop(locked_cache.put_with_weight(tree_id.clone(), data.clone()));
+                Tree::new(self.clone(), path.to_owned(), tree_id, data)
+            })
+            .collect())
+    }
+
+    /// Writes a batch of transient trees without retaining them in the tree cache.
+    pub async fn write_trees_uncached(
+        self: &Arc<Self>,
+        path: &RepoPath,
+        trees: Vec<backend::Tree>,
+    ) -> BackendResult<Vec<Tree>> {
+        let tree_ids = self.backend.write_trees(path, &trees).await?;
+        assert_eq!(tree_ids.len(), trees.len());
+        Ok(tree_ids
+            .into_iter()
+            .zip(trees)
+            .map(|(tree_id, tree)| {
+                let data = Arc::new(tree);
                 Tree::new(self.clone(), path.to_owned(), tree_id, data)
             })
             .collect())

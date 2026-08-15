@@ -26,8 +26,6 @@ use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use pollster::FutureExt as _;
-use rayon::iter::IntoParallelIterator as _;
-use rayon::prelude::ParallelIterator as _;
 
 use crate::backend;
 use crate::backend::BackendError;
@@ -476,47 +474,28 @@ impl TreeMerger {
         let mut resolved = vec![];
         let mut non_trivial = vec![];
         let mut reusable_input_terms: Vec<_> = (0..tree.iter().count()).collect();
-        // Keep only a small number of term-heavy entry merges alive at once. Large
-        // rebases can have thousands of terms, so collecting the whole tree before
-        // parallelizing would explode memory.
-        let chunk_size = self.store.concurrency().saturating_mul(2).clamp(1, 64);
-        let mut entries = all_merged_tree_entries(&tree);
-        loop {
-            let chunk: Vec<_> = entries
-                .by_ref()
-                .take(chunk_size)
-                .map(|(basename, input_value)| (basename.to_owned(), input_value))
-                .collect();
-            if chunk.is_empty() {
-                break;
-            }
-            let classified: Vec<_> = chunk
-                .into_par_iter()
-                .map(|(basename, input_value)| {
-                    classify_tree_entry(basename, input_value, same_change)
-                })
-                .collect();
-            for entry in classified {
-                match entry {
-                    ClassifiedTreeEntry::Resolved {
-                        basename,
-                        input_value,
-                        resolved_value,
-                        owned_value,
-                    } => {
-                        reusable_input_terms
-                            .retain(|&index| input_value.as_slice()[index] == resolved_value);
-                        if let Some(value) = owned_value {
-                            resolved.push((basename, value));
-                        }
+        // Classification only compares tree values and is cheaper than repeatedly
+        // crossing the Rayon fork/join barrier. Keep the expensive tree I/O and
+        // file merges parallel instead.
+        for (basename, input_value) in all_merged_tree_entries(&tree) {
+            match classify_tree_entry(basename.to_owned(), input_value, same_change) {
+                ClassifiedTreeEntry::Resolved {
+                    basename,
+                    input_value,
+                    resolved_value,
+                    owned_value,
+                } => {
+                    reusable_input_terms
+                        .retain(|&index| input_value.as_slice()[index] == resolved_value);
+                    if let Some(value) = owned_value {
+                        resolved.push((basename, value));
                     }
-                    ClassifiedTreeEntry::NonTrivial { basename, value } => {
-                        non_trivial.push((basename, value));
-                    }
+                }
+                ClassifiedTreeEntry::NonTrivial { basename, value } => {
+                    non_trivial.push((basename, value));
                 }
             }
         }
-        drop(entries);
 
         // If there are no non-trivial merges, we can write the tree now.
         if non_trivial.is_empty() {
@@ -651,7 +630,7 @@ async fn write_trees(
         }
     }
     let mut written_trees = store
-        .write_trees(&dir, backend_trees_to_write)
+        .write_trees_uncached(&dir, backend_trees_to_write)
         .await?
         .into_iter();
     for tree in &mut trees {

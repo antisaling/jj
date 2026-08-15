@@ -945,7 +945,7 @@ where
                 tree_id_merge
                     .try_map_async(async |id| {
                         if let Some(id) = id {
-                            store.get_tree(dir.to_owned(), id).await
+                            store.get_tree_uncached(dir.to_owned(), id).await
                         } else {
                             Ok(Tree::empty(store.clone(), dir.to_owned()))
                         }

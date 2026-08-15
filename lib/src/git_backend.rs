@@ -244,7 +244,7 @@ struct BufferedGitObject {
 
 const MIN_BUFFERED_OBJECTS_PER_PACK: usize = 128;
 const MIN_BUFFERED_BYTES_PER_PACK: usize = 1024 * 1024;
-const MAX_BUFFERED_GIT_OBJECT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BUFFERED_GIT_OBJECT_BYTES: usize = 1024 * 1024 * 1024;
 // Command-scoped batching can create many packs before Git GC or a multi-pack
 // index consolidates them. gix's default is only 32 index slots, which makes
 // the next checkpoint fail with InsufficientSlots.
@@ -1669,7 +1669,7 @@ impl FastSha1 {
     fn finalize(mut self) -> gix::hash::ObjectId {
         #[cfg(target_vendor = "apple")]
         {
-            let mut digest = [0; HASH_LENGTH];
+            let mut digest = [0; 20];
             // SAFETY: `digest` has SHA-1's required size and `context` is initialized.
             assert_eq!(
                 unsafe { cc_sha1_final(digest.as_mut_ptr(), &raw mut self.context) },
@@ -3982,7 +3982,7 @@ mod tests {
         let store_path = temp_dir.path().join("store");
         fs::create_dir(&store_path)?;
         let git_repo_path = temp_dir.path().join("git");
-        let git_repo = git_init(&git_repo_path);
+        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
         let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
 
         let mut write_batch = backend.start_write_batch();
