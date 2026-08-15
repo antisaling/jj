@@ -245,6 +245,10 @@ struct BufferedGitObject {
 const MIN_BUFFERED_OBJECTS_PER_PACK: usize = 128;
 const MIN_BUFFERED_BYTES_PER_PACK: usize = 1024 * 1024;
 const MAX_BUFFERED_GIT_OBJECT_BYTES: usize = 512 * 1024 * 1024;
+// Command-scoped batching can create many packs before Git GC or a multi-pack
+// index consolidates them. gix's default is only 32 index slots, which makes
+// the next checkpoint fail with InsufficientSlots.
+const GIT_OBJECT_STORE_SLOT_COUNT: u16 = 4096;
 const GIT_OBJECT_STORE_LOCK_FILE: &str = "jj-object-store.lock";
 
 impl BufferedGitObject {
@@ -1850,6 +1854,9 @@ fn gix_open_opts_from_settings(settings: &UserSettings) -> gix::open::Options {
     let user_name = settings.user_name();
     let user_email = settings.user_email();
     gix::open::Options::default()
+        .object_store_slots(gix::odb::store::init::Slots::Given(
+            GIT_OBJECT_STORE_SLOT_COUNT,
+        ))
         .config_overrides([
             // Committer has to be configured to record reflog. Author isn't
             // needed, but let's copy the same values.
@@ -3965,6 +3972,29 @@ mod tests {
             &bytes[index_hash_start..],
             hasher.try_finalize()?.as_bytes()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn write_batch_handles_more_than_default_odb_slots() -> TestResult {
+        let settings = user_settings();
+        let temp_dir = new_temp_dir();
+        let store_path = temp_dir.path().join("store");
+        fs::create_dir(&store_path)?;
+        let git_repo_path = temp_dir.path().join("git");
+        let git_repo = git_init(&git_repo_path);
+        let backend = GitBackend::init_external(&settings, &store_path, git_repo.path())?;
+
+        let mut write_batch = backend.start_write_batch();
+        for i in 0u32..33 {
+            let mut contents = vec![0x5a; MIN_BUFFERED_BYTES_PER_PACK];
+            contents[..std::mem::size_of_val(&i)].copy_from_slice(&i.to_ne_bytes());
+            backend
+                .write_file_bytes(RepoPath::root(), &contents)
+                .block_on()?;
+            write_batch.flush()?;
+        }
+        write_batch.finish()?;
         Ok(())
     }
 
