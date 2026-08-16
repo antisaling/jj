@@ -1282,6 +1282,17 @@ where
 
 impl WorkspaceCommandHelper {
     #[cfg(feature = "git")]
+    fn start_git_write_batch(&mut self) {
+        if self._git_write_batch.is_none() {
+            self._git_write_batch = self
+                .repo()
+                .store()
+                .backend_impl::<GitBackend>()
+                .map(GitBackend::start_write_batch);
+        }
+    }
+
+    #[cfg(feature = "git")]
     fn flush_git_write_batch(&mut self) -> Result<(), CommandError> {
         if let Some(write_batch) = self._git_write_batch.as_mut() {
             write_batch.flush()?;
@@ -1310,11 +1321,6 @@ impl WorkspaceCommandHelper {
         let op_summary_template_text = settings.get_string("templates.op_summary")?;
         let may_update_working_copy =
             may_snapshot_working_copy && env.command.should_commit_transaction();
-        #[cfg(feature = "git")]
-        let git_write_batch = repo
-            .store()
-            .backend_impl::<GitBackend>()
-            .map(GitBackend::start_write_batch);
 
         let helper = Self {
             workspace,
@@ -1325,7 +1331,9 @@ impl WorkspaceCommandHelper {
             may_snapshot_working_copy,
             may_update_working_copy,
             #[cfg(feature = "git")]
-            _git_write_batch: git_write_batch,
+            // Read-only commands may still load this helper. Start batching only
+            // once a path is known to mutate the repository.
+            _git_write_batch: None,
         };
         // Parse commit_summary template early to report error before starting
         // mutable operation.
@@ -1584,6 +1592,9 @@ impl WorkspaceCommandHelper {
         git_import_export_lock: &GitImportExportLock,
     ) -> Result<SnapshotStats, CommandError> {
         self.check_working_copy_writable()?;
+
+        #[cfg(feature = "git")]
+        self.start_git_write_batch();
 
         let workspace_name = self.workspace_name().to_owned();
         let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
@@ -2169,6 +2180,16 @@ to the current parents may contain changes from multiple commits.
                 .map_err(snapshot_command_error)?
         };
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
+            #[cfg(feature = "git")]
+            if self._git_write_batch.is_none() {
+                self._git_write_batch = self
+                    .user_repo
+                    .repo
+                    .store()
+                    .backend_impl::<GitBackend>()
+                    .map(GitBackend::start_write_batch);
+            }
+
             let mut tx = start_repo_transaction(
                 &self.user_repo.repo,
                 &workspace_name,
@@ -2375,6 +2396,9 @@ to the current parents may contain changes from multiple commits.
     }
 
     pub fn start_transaction(&mut self) -> WorkspaceCommandTransaction<'_> {
+        #[cfg(feature = "git")]
+        self.start_git_write_batch();
+
         let tx = start_repo_transaction(
             self.repo(),
             self.workspace_name(),
@@ -2847,6 +2871,14 @@ impl WorkspaceCommandTransaction<'_> {
     pub fn repo_mut(&mut self) -> &mut MutableRepo {
         self.id_prefix_context.take(); // invalidate
         self.tx.repo_mut()
+    }
+
+    /// Releases the Git object-store lock while keeping this transaction's write batch active.
+    /// Interactive editors must not hold the lock while waiting for user input.
+    #[cfg(feature = "git")]
+    pub(crate) fn release_git_write_batch_object_store_lock(&mut self) -> Result<(), CommandError> {
+        self.helper
+            .flush_and_release_git_write_batch_object_store_lock()
     }
 
     pub fn check_out(&mut self, commit: &Commit) -> Result<Commit, CheckOutCommitError> {

@@ -158,6 +158,8 @@ new working-copy commit.
     let description = if use_editor {
         commit_builder.set_description(description);
         let temp_commit = commit_builder.write_hidden().await?;
+        #[cfg(feature = "git")]
+        tx.release_git_write_batch_object_store_lock()?;
         let intro = "";
         let description = description_template(ui, &tx, intro, &temp_commit)?;
         let description = edit_description(&text_editor, &description)?;

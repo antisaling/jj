@@ -372,6 +372,8 @@ pub(crate) async fn cmd_squash(
                 if args.editor {
                     commit_builder.set_description(&description_with_trailers);
                     let temp_commit = commit_builder.write_hidden().await?;
+                    #[cfg(feature = "git")]
+                    tx.release_git_write_batch_object_store_lock()?;
                     let intro = "";
                     let template = description_template(ui, &tx, intro, &temp_commit)?;
                     edit_description(&text_editor, &template)?
@@ -393,6 +395,8 @@ pub(crate) async fn cmd_squash(
             // It's weird that commit.description() contains "JJ: " lines, but works.
             commit_builder.set_description(combined);
             let temp_commit = commit_builder.write_hidden().await?;
+            #[cfg(feature = "git")]
+            tx.release_git_write_batch_object_store_lock()?;
             let intro = "Enter a description for the combined commit.";
             let template = description_template(ui, &tx, intro, &temp_commit)?;
             edit_description(&text_editor, &template)?

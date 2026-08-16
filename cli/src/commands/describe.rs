@@ -179,6 +179,9 @@ pub(crate) async fn cmd_describe(
         )
         .await?;
 
+        #[cfg(feature = "git")]
+        tx.release_git_write_batch_object_store_lock()?;
+
         if let [(_, temp_commit)] = &*temp_commits {
             let intro = "";
             let template = description_template(ui, &tx, intro, temp_commit)?;

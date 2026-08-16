@@ -520,6 +520,12 @@ struct GitWriteBatch {
     commit_ids: HashSet<CommitId>,
 }
 
+impl GitWriteBatch {
+    fn has_pending_writes(&self) -> bool {
+        !self.object_ids.is_empty() || !self.commit_ids.is_empty() || self.table.is_some()
+    }
+}
+
 #[derive(Default)]
 struct GitWriteBatchState {
     batch: Option<GitWriteBatch>,
@@ -1427,7 +1433,12 @@ impl GitBackend {
         // then the extra metadata table.
         let locked_repo = self.lock_git_repo();
         let mut write_batch_state = self.write_batch_state.lock().unwrap();
-        if let Some(batch) = write_batch_state.batch.as_mut() {
+        if write_batch_state
+            .batch
+            .as_ref()
+            .is_some_and(GitWriteBatch::has_pending_writes)
+        {
+            let batch = write_batch_state.batch.as_mut().unwrap();
             // Reuse the command-scoped table and lock if a read discovers a Git
             // commit that hasn't been imported yet.
             batch.ensure_object_store_lock(self.git_repo_path())?;
@@ -4365,6 +4376,9 @@ mod tests {
         )?;
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
+        let write_batch = backend.start_write_batch();
+        let lock_path = backend.git_object_store_lock_path();
+        assert!(FileLock::try_lock(lock_path.clone())?.is_some());
 
         // read_commit() without import_head_commits() works as of now. This might be
         // changed later.
@@ -4381,6 +4395,8 @@ mod tests {
                 .is_some(),
             "extra metadata should have been be created"
         );
+        assert!(FileLock::try_lock(lock_path)?.is_some());
+        write_batch.finish()?;
         Ok(())
     }
 
