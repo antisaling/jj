@@ -495,7 +495,7 @@ impl CommandHelper {
         };
 
         let old_repo = workspace_command.repo().clone();
-        let (workspace_command, stats) = match workspace_command
+        let (mut workspace_command, stats) = match workspace_command
             .snapshot_impl(ui, &git_import_export_lock)
             .await
         {
@@ -519,6 +519,13 @@ impl CommandHelper {
                 self.recover_stale_working_copy(ui).await?
             }
         };
+
+        // Snapshotting may have flushed a Git write batch and left the
+        // object-store lock held. Release it before returning the helper: a
+        // read-only command such as `jj log` can then block in its pager
+        // without blocking unrelated Git readers or writers.
+        #[cfg(feature = "git")]
+        workspace_command.flush_and_release_git_write_batch_object_store_lock()?;
 
         let changed = old_repo.op_id() != workspace_command.repo().op_id();
         Ok((workspace_command, stats, changed))
